@@ -1,0 +1,8 @@
+{
+  "name": "JiboTube Pro",
+  "version": "1.0.5",
+  "supported": "3.1.6",
+  "type": "skill",
+  "themes": false,
+  "buttonColor": "#FF4545 #8F1717"
+}

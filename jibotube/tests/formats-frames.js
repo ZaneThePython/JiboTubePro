@@ -1,0 +1,26 @@
+'use strict';
+const assert = require('assert');
+const select = require('../helper/lib/format-selection').select;
+const frames = require('../video-frames');
+module.exports = function () {
+    const config = { maxHeight: 480, maxFps: 30 };
+    const sound = (id, track, rate) => ({ url: 'http://audio/' + id, mimeType: 'audio/mp4; codecs="mp4a.40.2"', itag: 140, audioTrack: track, audioSampleRate: rate || 44100 });
+    const picture = (height, fps) => ({ url: 'http://video/' + height + '/' + fps, height: height, fps: fps, mimeType: 'video/mp4; codecs="avc1.4d401e"' });
+    const foreign = sound('foreign', { id: 'es.4', displayName: 'Spanish' });
+    const english = sound('english', { id: 'en-US.4', displayName: 'English' });
+    const defaultTrack = sound('default', { id: 'en.4', audioIsDefault: true });
+    assert.strictEqual(select([foreign, defaultTrack, foreign], config).audio.url, defaultTrack.url, 'same itag must not override the default language');
+    assert.strictEqual(select([foreign, english, sound('another', { id: 'fr.4' }, 48000)], config).audio.url, english.url);
+    assert.strictEqual(select([english, sound('default-original', { id: 'ja.4', audioIsDefault: true })], config).audio.audioTrack.audioIsDefault, true);
+    const formats = [picture(720, 60), picture(480, 60), picture(360, 30), picture(480, 30), picture(1080, 30)];
+    const chosen = select(formats, config).video; assert.strictEqual(chosen.height, 480); assert.strictEqual(chosen.fps, 30);
+    assert.strictEqual(require('../helper/lib/config').maxHeight, 480);
+    let pending, cancelled = false, uploads = 0;
+    const scheduler = { requestAnimationFrame: fn => { pending = fn; return 1; }, cancelAnimationFrame: () => { cancelled = true; } };
+    const media = { currentTime: 0, readyState: 3, paused: false, webkitDecodedFrameCount: 1 };
+    const stop = frames(media, { update: () => uploads++ }, scheduler);
+    pending(); pending(); pending(); assert.strictEqual(uploads, 1, 'same decoded video frame is uploaded once');
+    media.webkitDecodedFrameCount = 2; pending(); assert.strictEqual(uploads, 2);
+    media.paused = true; media.webkitDecodedFrameCount = 3; pending(); assert.strictEqual(uploads, 2);
+    media.paused = false; pending(); assert.strictEqual(uploads, 3); stop(); pending(); assert.strictEqual(uploads, 3); assert(cancelled);
+};

@@ -1,0 +1,28 @@
+{
+  "name": "@be/jibotube",
+  "version": "1.0.5",
+  "description": "Browse, search, and watch YouTube on Jibo. Swipe down to exit.",
+  "main": "index.js",
+  "config": {
+    "standalone": true
+  },
+  "jibo": {
+    "main": "index.html",
+    "type": "asset-pack",
+    "launchRule": "launch.rule",
+    "prompt": "JiboTube",
+    "display-name": "jibotube"
+  },
+  "scripts": {
+    "test": "node tests/run.js"
+  },
+  "engines": {
+    "node": ">=6.0"
+  },
+  "dependencies": {},
+  "syncDependencies": [
+    "jibo",
+    "@be/be-framework"
+  ],
+  "license": "UNLICENSED"
+}

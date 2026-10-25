@@ -1,0 +1,1 @@
+TopRule = $* ((jibotube) | (jibo tube) | (open jibotube) | (play jibotube)) $* {skill='\@be/jibotube'};
