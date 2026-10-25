@@ -2,7 +2,7 @@
 
 // On-robot buffered streaming. YouTube's adaptive AVC/AAC streams are
 // fragmented MP4 with a tiny sidx index. We fetch the init segment and index,
-// map a playback time to a fragment, and proxy the fragments to GStreamer over
+// map a playback time to a fragment, and proxy the fragments to the media player over
 // plain localhost HTTP as they are needed. No ffmpeg and no full-file download.
 //
 // googlevideo throttles an open-ended range (`bytes=N-`) to a few KB/s, while
@@ -83,31 +83,38 @@ function parseSidx(buffer) {
   };
 }
 
-// Small bounded reads (init segment, sidx). googlevideo may redirect to
-// another edge server, which openRange follows.
-function fetchRange(_x, _x2, _x3) {
-  return _fetchRange.apply(this, arguments);
-}
-function _fetchRange() {
-  _fetchRange = _asyncToGenerator(function* (target, start, end) {
-    const upstream = yield openRange(target, start, end);
-    return new Promise(function (resolve, reject) {
-      const chunks = [];
-      upstream.response.on('data', function (chunk) {
-        chunks.push(chunk);
-      });
-      upstream.response.on('end', function () {
-        resolve(Buffer.concat(chunks));
-      });
-      upstream.response.on('error', reject);
-      upstream.response.on('aborted', function () {
-        reject(new Error('range_aborted'));
-      });
-    });
+// Buffer only an exact bounded range; redirects and body share one deadline.
+function fetchRange(target, start, end, session, deadline) {
+  const size = end - start + 1,
+    util = require('./util');
+  if (!isFinite(start) || !isFinite(end) || start < 0 || size < 1 || size > CHUNK_BYTES || Math.floor(start) !== start || Math.floor(end) !== end) return Promise.reject(util.failure('range_size'));
+  return util.requestBuffer(target, {
+    headers: {
+      'User-Agent': innertube.PLAYER_USER_AGENT,
+      'Accept-Encoding': 'identity',
+      'Range': 'bytes=' + start + '-' + end
+    },
+    timeoutMs: deadline ? Math.max(1, Math.min(20000, deadline - util.now())) : 20000,
+    maxBytes: size,
+    retries: 0,
+    registerCancel: session ? function (cancel) {
+      session.current = cancel;
+      if (session.closed) cancel();
+    } : null
+  }).then(function (result) {
+    const range = /^bytes (\d+)-(\d+)\/(\d+|\*)$/.exec(result.headers['content-range'] || '');
+    if (result.status !== 206 || !range || Number(range[1]) !== start || Number(range[2]) !== end) throw util.failure('range_mismatch');
+    if (result.buffer.length !== size) throw util.failure('range_short');
+    return result.buffer;
+  }).then(function (bytes) {
+    if (session) session.current = null;
+    return bytes;
+  }, function (error) {
+    if (session) session.current = null;
+    throw error;
   });
-  return _fetchRange.apply(this, arguments);
 }
-function loadIndex(_x4, _x5) {
+function loadIndex(_x, _x2) {
   return _loadIndex.apply(this, arguments);
 }
 function _loadIndex() {
@@ -149,7 +156,7 @@ function _loadIndex() {
       at: Date.now(),
       value: value
     });
-    if (indexCache.size > 80) indexCache.delete(indexCache.keys().next().value);
+    if (indexCache.size > 8) indexCache.delete(indexCache.keys().next().value);
     return value;
   });
   return _loadIndex.apply(this, arguments);
@@ -185,7 +192,7 @@ function chooseAtOrAfter(entries, seconds) {
 function streamPath(id, kind, frag, start) {
   return '/stream/' + id + '/' + kind + '?frag=' + frag + '&t=' + Number(start || 0).toFixed(3);
 }
-function info(_x6, _x7, _x8) {
+function info(_x3, _x4, _x5) {
   return _info.apply(this, arguments);
 }
 function _info() {
@@ -196,7 +203,20 @@ function _info() {
     const segments = yield sponsor.segments(id, video.duration).catch(function () {
       return [];
     });
-    const videoIndex = yield loadIndex(video.formats.video, 'video');
+    const candidates = video.formats.videoCandidates || [video.formats.video];
+    let videoIndex = null,
+      fallback = false;
+    for (let i = 0; i < Math.min(3, candidates.length); i++) {
+      try {
+        videoIndex = yield loadIndex(candidates[i], 'video');
+        video.formats.video = candidates[i];
+        fallback = i > 0;
+        break;
+      } catch (error) {
+        if (error.code === 'timeout') throw error;
+      }
+    }
+    if (!videoIndex) throw require('./util').failure('unsupported_format');
     const audioIndex = video.formats.audio ? yield loadIndex(video.formats.audio, 'audio') : null;
     let at = Number(position) || 0;
     if (at < 0) at = 0;
@@ -215,6 +235,7 @@ function _info() {
       height: video.formats.video.height || 0,
       videoMime: video.formats.video.mimeType,
       audioMime: video.formats.audio ? video.formats.audio.mimeType : '',
+      status: fallback ? 'format_fallback' : 'ready',
       start: start,
       video: streamPath(id, 'video', videoFrag, start),
       audio: audioIndex ? streamPath(id, 'audio', audioFrag, start) : '',
@@ -223,88 +244,12 @@ function _info() {
   });
   return _info.apply(this, arguments);
 }
-function openRange(target, start, end, attempt) {
-  attempt = attempt || 0;
-  return new Promise(function (resolve, reject) {
-    const parsed = url.parse(target);
-    const lib = parsed.protocol === 'https:' ? https : http;
-    const req = lib.get({
-      protocol: parsed.protocol,
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.path,
-      headers: {
-        'User-Agent': innertube.PLAYER_USER_AGENT,
-        'Accept-Encoding': 'identity',
-        'Range': 'bytes=' + start + '-' + end
-      }
-    }, function (response) {
-      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        response.resume();
-        if (attempt >= 4) {
-          reject(new Error('range_redirect'));
-          return;
-        }
-        resolve(openRange(url.resolve(target, response.headers.location), start, end, attempt + 1));
-        return;
-      }
-      if (response.statusCode !== 206) {
-        response.resume();
-        const error = new Error('range_http_' + response.statusCode);
-        error.status = response.statusCode;
-        reject(error);
-        return;
-      }
-      resolve({
-        response: response,
-        request: req,
-        url: target
-      });
-    });
-    req.setTimeout(20000, function () {
-      req.destroy(new Error('range_timeout'));
-    });
-    req.on('error', reject);
-  });
-}
-
-// Read one bounded range completely; resolves with its pieces as received
-// (possibly fewer bytes than asked) and their total length, without copying
-// them into one buffer. `session.current` aborts it when the player goes away.
 function readRange(session, start, end) {
-  return openRange(session.target, start, end).then(function (upstream) {
-    session.target = upstream.url; // stay on the edge server a redirect chose
-    return new Promise(function (resolve, reject) {
-      const pieces = [];
-      let length = 0,
-        done = false;
-      const finish = function (error) {
-        if (done) return;
-        done = true;
-        session.current = null;
-        if (error) reject(error);else resolve({
-          pieces: pieces,
-          length: length
-        });
-      };
-      session.current = function () {
-        try {
-          upstream.request.destroy();
-        } catch (_) {}
-        finish(new Error('closed'));
-      };
-      upstream.response.on('data', function (chunk) {
-        pieces.push(chunk);
-        length += chunk.length;
-      });
-      upstream.response.on('end', function () {
-        finish();
-      });
-      upstream.response.on('error', finish);
-      upstream.response.on('aborted', function () {
-        finish(new Error('range_aborted'));
-      });
-    });
+  return fetchRange(session.target, start, end, session).then(function (bytes) {
+    return {
+      pieces: [bytes],
+      length: bytes.length
+    };
   });
 }
 
@@ -513,24 +458,59 @@ function sleep(ms) {
 
 // The signed URL can expire or be refused mid-video; fetch a fresh one for the
 // same itag (the byte layout is identical) before giving up.
-function refreshUrl(_x9, _x0, _x1) {
+function refreshUrl(_x6, _x7, _x8) {
   return _refreshUrl.apply(this, arguments);
 }
 function _refreshUrl() {
   _refreshUrl = _asyncToGenerator(function* (id, kind, itag) {
     innertube.forget(id);
     const video = yield yt.video(id);
-    const format = kind === 'audio' ? video.formats.audio : video.formats.video;
-    if (!format || format.itag !== itag) throw new Error('format_changed');
+    const candidates = kind === 'audio' ? [video.formats.audio] : video.formats.videoCandidates || [video.formats.video];
+    const format = candidates.filter(function (f) {
+      return f && String(f.itag) === String(itag);
+    })[0];
+    if (!format) throw new Error('format_changed');
     return format.url;
   });
   return _refreshUrl.apply(this, arguments);
 }
-function proxy(_x10, _x11, _x12, _x13, _x14, _x15) {
+let activeProxies = 0;
+function proxy(_x9, _x0, _x1, _x10, _x11, _x12) {
   return _proxy.apply(this, arguments);
 }
 function _proxy() {
   _proxy = _asyncToGenerator(function* (id, kind, frag, start, request, response) {
+    if (activeProxies >= 2) throw require('./util').failure('provider_busy');
+    activeProxies++;
+    const session = {
+      closed: false,
+      current: null,
+      rebaser: null
+    };
+    const close = function () {
+      if (session.closed) return;
+      session.closed = true;
+      if (session.current) session.current();
+    };
+    session.close = close;
+    request.on('aborted', close);
+    response.on('close', close);
+    try {
+      return yield proxyOwned(id, kind, frag, start, request, response, session);
+    } finally {
+      close();
+      request.removeListener('aborted', close);
+      response.removeListener('close', close);
+      activeProxies--;
+    }
+  });
+  return _proxy.apply(this, arguments);
+}
+function proxyOwned(_x13, _x14, _x15, _x16, _x17, _x18, _x19) {
+  return _proxyOwned.apply(this, arguments);
+}
+function _proxyOwned() {
+  _proxyOwned = _asyncToGenerator(function* (id, kind, frag, start, request, response, session) {
     id = videoId(id);
     if (!id || kind !== 'video' && kind !== 'audio') throw new Error('bad_stream');
     const video = yield yt.video(id);
@@ -542,18 +522,8 @@ function _proxy() {
     if (at < 0) at = 0;
     if (at >= index.entries.length) at = index.entries.length - 1;
     const base = Math.max(0, Number(start) || 0);
-    const session = {
-      closed: false,
-      current: null,
-      rebaser: new Rebaser(Math.round(base * index.timescale), kind === 'audio')
-    };
-    const close = function () {
-      if (session.closed) return;
-      session.closed = true;
-      if (session.current) session.current();
-    };
-    request.on('aborted', close);
-    response.on('close', close);
+    if (session.closed || request.aborted || response.destroyed) return;
+    session.rebaser = new Rebaser(Math.round(base * index.timescale), kind === 'audio');
     response.writeHead(200, {
       'Content-Type': kind === 'audio' ? 'audio/mp4' : 'video/mp4',
       'Access-Control-Allow-Origin': '*',
@@ -579,13 +549,13 @@ function _proxy() {
             throw new Error('range_empty');
           } catch (error) {
             if (session.closed) return null;
-            console.error('stream ' + id + ' ' + kind + ' @' + from + ': ' + (error.message || error) + ' (attempt ' + failures + ')');
+            console.error('stream ' + id + ' ' + kind + ' @' + from + ': ' + require('./util').safeCode(error) + ' (attempt ' + failures + ')');
             if (failures >= CHUNK_ATTEMPTS) throw error;
             if (error.status === 403 || error.status === 410) {
               try {
                 session.target = yield refreshUrl(id, kind, format.itag);
               } catch (refreshError) {
-                console.error('stream ' + id + ' refresh: ' + refreshError.message);
+                console.error('stream ' + id + ' refresh: ' + require('./util').safeCode(refreshError));
               }
             } else {
               yield sleep(500 * failures);
@@ -593,17 +563,26 @@ function _proxy() {
           }
         }
       });
-      return function fetchChunk(_x17, _x18) {
+      return function fetchChunk(_x21, _x22) {
         return _ref.apply(this, arguments);
       };
     }();
     const drained = function () {
       return new Promise(function (resolve) {
+        let timer = null;
         const done = function () {
+          clearTimeout(timer);
           response.removeListener('drain', done);
           response.removeListener('close', done);
           resolve();
         };
+        timer = setTimeout(function () {
+          session.close();
+          try {
+            response.destroy();
+          } catch (_) {}
+          done();
+        }, 15000);
         response.on('drain', done);
         response.on('close', done);
       });
@@ -618,7 +597,7 @@ function _proxy() {
           }
         }
       });
-      return function send(_x19) {
+      return function send(_x23) {
         return _ref2.apply(this, arguments);
       };
     }();
@@ -635,7 +614,7 @@ function _proxy() {
         collectGarbage();
       }
     } catch (error) {
-      console.error('stream ' + id + ' ' + kind + ': giving up at byte ' + offset + ' (' + (error.message || error) + ')');
+      console.error('stream ' + id + ' ' + kind + ': giving up at byte ' + offset + ' (' + require('./util').safeCode(error) + ')');
       try {
         response.destroy();
       } catch (_) {}
@@ -644,9 +623,9 @@ function _proxy() {
     console.log('stream ' + id + ' ' + kind + ' frag ' + at + ': ' + (session.closed ? 'player closed' : 'complete') + ' at byte ' + offset + '/' + (last + 1));
     if (!session.closed) response.end();
   });
-  return _proxy.apply(this, arguments);
+  return _proxyOwned.apply(this, arguments);
 }
-function captions(_x16) {
+function captions(_x20) {
   return _captions.apply(this, arguments);
 }
 function _captions() {
@@ -658,14 +637,14 @@ function _captions() {
     const key = id + ':' + video.captionUrl;
     const hit = captionCache.get(key);
     if (hit && Date.now() - hit.at < CAPTION_TTL_MS) return hit.cues;
-    const cues = yield yt.captions(video.captionUrl).catch(function () {
+    const cues = (yield yt.captions(video.captionUrl).catch(function () {
       return [];
-    });
+    })).slice(0, 4000);
     captionCache.set(key, {
       at: Date.now(),
       cues: cues
     });
-    if (captionCache.size > 100) captionCache.delete(captionCache.keys().next().value);
+    if (captionCache.size > 8) captionCache.delete(captionCache.keys().next().value);
     return cues;
   });
   return _captions.apply(this, arguments);

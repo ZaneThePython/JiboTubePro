@@ -1,6 +1,7 @@
 'use strict';
 
 const jibo = require('jibo');
+const diagnostics = require('./diagnostics');
 const timers = require('timers');
 const FACE_HELD_MS = 250;
 const BeSkill = require('@be/be-framework').BeSkill;
@@ -9,52 +10,52 @@ const video = require('./video');
 const ClientModule = require('./client');
 const ServiceModule = require('./service');
 const StoreModule = require('./store');
-const UI = require('./ui').UI;
+const UIModule = require('./ui');
+const UI = UIModule.UI;
 const Overlay = require('./overlay').Overlay;
-const diagnostics = require('./diagnostics');
 
 const MAX_HOME_ROWS = 9;
+const SESSION_LIMIT_MS = 4 * 60 * 60 * 1000;
+function monotonic() { if (typeof process === 'undefined' || typeof process.hrtime !== 'function') return Date.now(); const t = process.hrtime(); return t[0] * 1000 + t[1] / 1e6; }
+const MAX_STACK = 12;
+const LIKE_SETTLE_MS = 700;
+const HINT = 'Tap the video to show the controls';
 
 function itemFor(item) {
     return { id: item.id, title: item.title, channel: item.channel || '', duration: Number(item.duration) || 0,
         music: !!(item && item.music) };
 }
-function statusOf(error) {
-    const code = error && (error.code || error.message) || 'unknown';
-    if (code === 'unauthorized') return 'The companion service token is wrong.';
-    if (code === 'timeout') return 'The companion service did not answer.';
-    return 'The companion service is not reachable.';
+function statusInfo(code, context) {
+    if (typeof UIModule.statusInfo === 'function') return UIModule.statusInfo(code, { context: context });
+    return { code: code && code.code || code, retryable: true, action: 'retry' };
 }
 
 class JiboTubeSkill extends BeSkill {
     constructor() {
         super(...arguments);
-        this.generation = 0; this.pageRequestId = 0; this.view = null; this.ui = null; this.client = null; this.store = null;
+        this.pageRequestId = 0; this.generation = 0; this.view = null; this.ui = null; this.client = null; this.store = null;
         this.events = []; this.closing = null; this.leaving = false; this.opened = false;
         this.session = null; this.overlay = null; this.playGeneration = 0; this.tickTimer = null; this.voiceTimer = null;
-        this.lastRender = 0; this.libConfirmTimer = null; this.voiceRequest = null;
+        this.lastRender = 0; this.voiceRequest = null; this.busyTimer = null; this.lastLikeAt = 0;
         this.state = null;
-    }
-
-    preload(done) {
-        try { ServiceModule.settings(); done(); } catch (error) { done(error); }
     }
 
     open() {
         if (this.view) return;
         const generation = ++this.generation, views = jibo.face && jibo.face.views;
         this.closing = null; this.leaving = false; this.opened = false;
+        this.playbackStartedMono = null; this.playbackRecovery = null;
         if (!views || !views.createView || !views.changeView || !global.PIXI) { this.exit({ noElementsOfSurprise: true }); return; }
         this.store = new StoreModule.Store();
         const settings = ServiceModule.settings();
         this.client = new ClientModule.Client(settings);
         this.state = {
-            screen: 'loading', tab: 'home', loading: true, status: null, query: '', symbols: false,
+            screen: 'loading', tab: 'home', loading: true, status: { code: 'starting_service', busy: true }, query: '', symbols: false,
             recentSearches: this.store.state.searches.slice(0, 4), home: null, homeTop: 0, shelfOffsets: {},
             results: null, resultsPage: 0, details: null, relatedPage: 0, liked: false, thumbUrl: '', prepare: null,
-            pendingPlay: false, resumePosition: 0, detailId: '', previous: 'home',
+            pendingPlay: false, resumePosition: 0, detailId: '', stack: [], retryTab: 'home', searchBusy: false,
             library: { history: this.store.state.history, likes: this.store.state.likes }, libConfirm: false,
-            player: null, voiceText: '', toast: '', toastAt: 0, railStatus: 'NO ADS',
+            player: null, voiceText: '', toast: '', toastAt: 0,
             musicHome: null, musicHomeTop: 0, musicLoaded: false, searchMode: 'all', detailsMusic: false,
             captions: [], captionsFor: ''
         };
@@ -88,13 +89,8 @@ class JiboTubeSkill extends BeSkill {
                     }
                 } catch (_) {}
                 this.tickTimer = timers.setInterval(() => this.tick(generation), 1000);
-                if (!this.client.configured()) { this.fail('JiboTube could not start', 'Close JiboTube and try again.'); return; }
-                const current = this.pageRequest();
-                ServiceModule.ensure(this.client.settings).then(ok => {
-                    if (!current()) return;
-                    if (!ok) { this.fail('JiboTube could not start', 'Close JiboTube and try again.'); return; }
-                    this.loadHome(generation);
-                });
+                if (!this.client.configured()) { this.fail('service_unavailable'); return; }
+                this.startService(generation);
             } catch (_) { this.leave(generation); }
         }, () => {
             if (generation === this.generation && this.view === view) { this.leaving = true; this.exit({ noElementsOfSurprise: true }); }
@@ -121,12 +117,12 @@ class JiboTubeSkill extends BeSkill {
             openVideo: call('openVideoById'), play: call('play'), like: call('like'), related: call('related'),
             relatedPage: call('relatedPage'), libCard: call('libCard'), clearHistory: call('clearHistory'),
             togglePlay: call('togglePlay'), seek: call('seek'), seekTo: call('seekTo'), next: call('next'),
-            replay: call('replay'), cancelAutoplay: call('cancelAutoplay'), playerBack: call('playerBack'),
-            statusAction: call('statusAction'), volumeUp: call('volumeUp'), volumeDown: call('volumeDown'),
+            replay: call('replay'), cancelAutoplay: call('cancelAutoplay'), playerBack: call('playerBack'), playNext: call('playNext'),
+            statusAction: call('statusAction'), resultsAction: call('resultsAction'), volumeUp: call('volumeUp'), volumeDown: call('volumeDown'),
             screenTap: call('screenTap'), toggleSettings: call('toggleSettings'), closeSettings: call('closeSettings'),
             toggleCaptions: call('toggleCaptions'), setLoop: call('setLoop'),
-            setAutoplay: call('setAutoplay'),
-            setSearchMode: call('setSearchMode'), musicSearchOpen: call('musicSearchOpen')
+            setAutoplay: call('setAutoplay'), confirmClearHistory: call('confirmClearHistory'), cancelClearHistory: call('cancelClearHistory'),
+            setSearchMode: call('setSearchMode'), musicSearchOpen: call('musicSearchOpen'), noop: () => {}
         };
     }
 
@@ -139,15 +135,39 @@ class JiboTubeSkill extends BeSkill {
 
     render() {
         this.lastRender = Date.now();
-        if (this.ui && this.view && this.view.state !== 'destroyed') this.ui.render(this.state);
+        if (this.ui && this.view && this.view.state !== 'destroyed') {
+            this.ui.render(this.state);
+            this.syncBusyTimer();
+        }
     }
+    // While something is visibly working (loading, searching, a video getting
+    // ready) its progress bar moves; the 1 s tick would make it look stuck.
+    busyShown() {
+        const f = this.ui && this.ui.frame, s = this.state;
+        if (!f || !s || this.leaving) return false;
+        if (f.status && f.status.busy) return true;
+        if (s.screen === 'results' && s.loading) return true;
+        if (s.screen === 'player' && s.player && s.player.starting && !s.player.session) return true;
+        return !!(f.detail && f.detail.busy && s.screen === 'details');
+    }
+    syncBusyTimer() {
+        const busy = this.busyShown();
+        if (busy && !this.busyTimer) {
+            const generation = this.generation;
+            this.busyTimer = timers.setInterval(() => {
+                if (generation !== this.generation || !this.busyShown()) { this.stopBusyTimer(); return; }
+                if (this.ui && this.view && this.view.state !== 'destroyed') this.ui.render(this.state);
+            }, 250);
+        } else if (!busy) this.stopBusyTimer();
+    }
+    stopBusyTimer() { if (this.busyTimer) { timers.clearInterval(this.busyTimer); this.busyTimer = null; } }
     // Player controls are drawn as video layers, but taps hit-test the PIXI
     // buttons under them, whose visibility only ui.render sets. Re-render
     // whenever what is tappable changes, or settings chips stay unreachable
     // and taps fall through to the buttons beneath.
     syncPlayerHitAreas() {
         const player = this.state.player;
-        const key = player ? [player.generation, player.controlsVisible, player.settingsOpen, player.ended, !!player.session, player.starting].join('|') : '';
+        const key = player ? [player.generation, player.controlsVisible, player.settingsOpen, player.ended, !!player.session, player.starting, player.paused, !!player.nextTitle].join('|') : '';
         if (key === this.hitAreaKey) return;
         this.hitAreaKey = key;
         this.render();
@@ -160,7 +180,15 @@ class JiboTubeSkill extends BeSkill {
         }
     }
     toast(text) {
-        this.state.toast = text; this.state.toastAt = Date.now();
+        // During playback the BE screen is under the video: use the player's
+        // own message layer, which is cut out of the picture.
+        const player = this.state.screen === 'player' && this.state.player;
+        if (player && player.session && this.overlay) {
+            player.toast = text; player.toastUntil = Date.now() + 4000;
+            this.overlay.update(player.session, player, false);
+            return;
+        }
+        this.state.toast = text; this.state.toastAt = Date.now(); this.state.toastScreen = this.state.screen + '|' + (this.state.detailId || '');
         this.render();
     }
     volumeLevel() {
@@ -221,18 +249,43 @@ class JiboTubeSkill extends BeSkill {
     volumeUp() { this.changeVolume(1); }
     volumeDown() { this.changeVolume(-1); }
 
-    fail(title, body) {
+    statusFor(error) {
+        return ClientModule.status(error);
+    }
+    failStatus(error, tab) {
+        this.fail(error, tab);
+    }
+    // A full-screen problem with one next step (see ui.js STATUS).
+    fail(code, tab) {
         this.state.loading = false; this.state.screen = 'error';
-        this.state.status = { title: title, body: body, action: 'Try again' };
+        this.state.retryTab = tab || this.state.retryTab || 'home';
+        this.state.status = this.statusFor(typeof code === 'object' ? code : { code: code || 'failed' });
         this.render();
     }
+    // Try again: one attempt at a time. While it runs the button is replaced
+    // by a moving bar, so repeated taps cannot queue more service starts.
     retry() {
-        const generation = this.generation, current = this.pageRequest();
-        this.state.status = null; this.state.screen = 'loading';
-        ServiceModule.ensure(this.client.settings).then(() => {
+        if (this.state.status && this.state.status.busy) return;
+        const generation = this.generation, tab = this.state.retryTab || 'home';
+        this.state.status = { code: 'starting_service', busy: true }; this.state.screen = 'loading'; this.state.loading = true;
+        this.render();
+        this.startService(generation, tab);
+    }
+    startService(generation, retryTab) {
+        const tab = retryTab || this.state.retryTab || 'home';
+        const owned = this.pageRequest();
+        const current = () => owned() && this.state.screen === 'loading' && this.state.retryTab === tab;
+        return ServiceModule.ensure(this.client.settings).then(ok => {
+            if (generation !== this.generation || this.leaving) return false;
+            if (!ok) { if (current()) this.failStatus({ code: typeof ServiceModule.status === 'function' && ServiceModule.status() || 'service_unavailable' }, tab); return false; }
+            return this.client.providerHealth().then(() => {
+                // The user may already have moved to another tab.
             if (!current()) return;
-            this.loadHome(generation);
-        });
+                if (tab === 'music') { this.state.musicHome = null; this.loadMusicHome(generation); }
+                else if (tab === 'trending') this.showTrending();
+                else this.loadHome(generation);
+            });
+        }).catch(error => { if (current()) this.failStatus(error, tab); });
     }
 
     pageRequest() {
@@ -243,37 +296,41 @@ class JiboTubeSkill extends BeSkill {
     loadHome(generation) {
         if (!this.active(generation) && this.opened) return;
         const current = this.pageRequest();
-        this.state.loading = true; this.state.screen = 'loading';
-        this.state.status = { title: 'Loading JiboTube', body: 'Finding something good…' };
+        this.state.loading = true; this.state.screen = 'loading'; this.state.retryTab = 'home';
+        this.state.status = { code: 'loading', busy: true };
         this.render();
         this.client.home(this.store.payload()).then(home => {
             if (!current()) return;
             this.state.home = this.enrichHome(home);
+            if (this.state.tab !== 'home' || this.state.screen !== 'loading') { this.render(); return; }
             this.state.loading = false; this.state.status = null; this.state.screen = 'home'; this.state.tab = 'home';
-            this.state.emptyText = '';
+            this.state.stack = [];
             this.render();
         }).catch(error => {
             if (!current()) return;
-            this.fail('Could not reach JiboTube', statusOf(error));
+            if (this.state.tab !== 'home' || this.state.screen !== 'loading') return;
+            this.failStatus(error, 'home');
         });
     }
 
     loadMusicHome(generation) {
         if (!this.active(generation) && this.opened) return;
         const current = this.pageRequest();
-        this.state.loading = true; this.state.screen = 'loading';
-        this.state.status = { title: 'Loading music', body: 'Finding songs and artists…' };
+        this.state.loading = true; this.state.screen = 'loading'; this.state.retryTab = 'music';
+        this.state.status = { code: 'loading', busy: true };
         this.render();
         this.client.musicHome(this.store.payload()).then(home => {
             if (!current()) return;
             this.state.musicHome = this.enrichHome(home);
             this.state.musicLoaded = true;
+            if (this.state.tab !== 'music' || this.state.screen !== 'loading') { this.render(); return; }
             this.state.loading = false; this.state.status = null;
-            this.state.screen = 'music'; this.state.tab = 'music';
+            this.state.screen = 'music'; this.state.tab = 'music'; this.state.stack = [];
             this.render();
         }).catch(error => {
             if (!current()) return;
-            this.fail('Could not load music', statusOf(error));
+            if (this.state.tab !== 'music' || this.state.screen !== 'loading') return;
+            this.failStatus(error, 'music');
         });
     }
 
@@ -289,56 +346,108 @@ class JiboTubeSkill extends BeSkill {
         return copy;
     }
 
+    // The rail: switching tabs starts a fresh history for Back.
     nav(tab) {
         this.pageRequestId++; this.state.loading = false;
+        this.state.searchBusy = false; this.searchToken = (this.searchToken || 0) + 1;
         this.cancelVoice(false);
         this.stopVideo('nav');
         this.state.player = null; this.dropOverlay();
+        this.state.stack = []; this.state.libConfirm = false; this.state.searchFrom = '';
         if (tab === 'home') {
             this.state.tab = 'home';
-            if (this.state.home) { this.state.screen = 'home'; this.state.status = null; this.render(); }
+            if (this.state.home) { this.state.screen = 'home'; this.state.status = null; this.state.loading = false; this.render(); }
             else this.loadHome(this.generation);
         } else if (tab === 'music') {
             this.state.tab = 'music';
-            if (this.state.musicHome) { this.state.screen = 'music'; this.state.status = null; this.render(); }
+            if (this.state.musicHome) { this.state.screen = 'music'; this.state.status = null; this.state.loading = false; this.render(); }
             else this.loadMusicHome(this.generation);
         } else if (tab === 'trending') {
             this.state.tab = 'trending';
             this.showTrending();
         } else if (tab === 'search') {
-            this.state.tab = 'search'; this.state.screen = 'search'; this.state.status = null; this.render();
+            this.state.tab = 'search'; this.state.screen = 'search'; this.state.status = null; this.state.loading = false; this.render();
         } else if (tab === 'library') {
-            this.state.tab = 'library'; this.openLibrary();
+            this.state.tab = 'library'; this.state.status = null; this.state.loading = false; this.openLibrary();
         }
     }
 
     showTrending() {
-        const current = this.pageRequest();
         const row = this.state.home && this.state.home.rows.filter(item => item.id === 'trending')[0];
         if (row) {
-            this.state.previous = 'home';
-            this.state.results = { title: 'Trending now', items: row.items.slice(), back: true };
-            this.state.resultsPage = 0; this.state.screen = 'results'; this.state.status = null;
+            this.state.results = { title: 'Trending now', items: row.items.slice(), back: false };
+            this.state.resultsPage = 0; this.state.screen = 'results'; this.state.status = null; this.state.loading = false;
             this.render();
             return;
         }
-        this.state.loading = true; this.state.screen = 'loading';
-        this.state.status = { title: 'Loading trending', body: 'Checking what is popular…' };
+        const current = this.pageRequest();
+        this.state.loading = true; this.state.screen = 'loading'; this.state.retryTab = 'trending';
+        this.state.status = { code: 'loading', busy: true };
         this.render();
         this.client.search('trending now').then(result => {
-            if (!current()) return;
-            this.state.results = { title: 'Trending now', items: result.items.map(item => this.enrich(item, 'mqdefault')), back: true };
+            if (!current() || this.state.tab !== 'trending' || this.state.screen !== 'loading') return;
+            this.state.results = { title: 'Trending now', items: (result.items || []).map(item => this.enrich(item, 'mqdefault')), back: false };
             this.state.resultsPage = 0; this.state.loading = false; this.state.status = null; this.state.screen = 'results';
             this.render();
-        }).catch(error => { if (current()) this.fail('Could not load trending', statusOf(error)); });
+        }).catch(error => {
+            if (!current() || this.state.tab !== 'trending' || this.state.screen !== 'loading') return;
+            this.failStatus(error, 'trending');
+        });
     }
 
     openLibrary() {
         this.pageRequestId++; this.state.loading = false;
         this.state.library = { history: this.store.state.history.map(item => this.enrich(item, 'mqdefault')),
             likes: this.store.state.likes.map(item => this.enrich(item, 'mqdefault')) };
-        this.state.screen = 'library'; this.state.status = null;
+        this.state.screen = 'library'; this.state.status = null; this.state.libConfirm = false;
         this.render();
+    }
+
+    // Back history. Each entry restores exactly what the user saw: a screen
+    // plus the context it needs (results and page, a video's details).
+    snapshot() {
+        const s = this.state;
+        const entry = { screen: s.screen === 'voice' ? 'search' : s.screen, tab: s.tab, query: s.query, symbols: s.symbols,
+            searchMode: s.searchMode, homeTop: s.homeTop, musicHomeTop: s.musicHomeTop, shelfOffsets: Object.assign({}, s.shelfOffsets) };
+        if (entry.screen === 'results') { entry.results = s.results; entry.resultsPage = s.resultsPage || 0; }
+        if (entry.screen === 'details') {
+            entry.details = s.details; entry.detailId = s.detailId; entry.relatedPage = s.relatedPage || 0; entry.thumbUrl = s.thumbUrl;
+            entry.prepare = s.prepare; entry.liked = s.liked; entry.detailsMusic = s.detailsMusic; entry.resumePosition = s.resumePosition;
+        }
+        if (entry.screen === 'search') { entry.searchFrom = s.searchFrom || ''; entry.searchMode = s.searchMode; }
+        return entry;
+    }
+    pushScreen() {
+        const s = this.state;
+        if (['home', 'music', 'results', 'details', 'search', 'library', 'voice'].indexOf(s.screen) < 0) return;
+        s.stack = s.stack || [];
+        const entry = this.snapshot(), top = s.stack[s.stack.length - 1];
+        // Never stack the same details twice (Next/autoplay chains replace).
+        if (top && top.screen === 'details' && entry.screen === 'details' && top.detailId === entry.detailId) return;
+        s.stack = s.stack.concat([entry]).slice(-MAX_STACK);
+    }
+    restore(entry) {
+        const s = this.state;
+        s.status = null; s.loading = false; s.libConfirm = false;
+        s.tab = entry.tab || s.tab;
+        s.query = entry.query || ''; s.symbols = !!entry.symbols; s.searchMode = entry.searchMode || 'all';
+        s.homeTop = entry.homeTop || 0; s.musicHomeTop = entry.musicHomeTop || 0; s.shelfOffsets = Object.assign({}, entry.shelfOffsets);
+        if (entry.screen === 'results') { s.results = entry.results; s.resultsPage = entry.resultsPage || 0; }
+        if (entry.screen === 'details') {
+            s.details = entry.details; s.detailId = entry.detailId; s.relatedPage = entry.relatedPage || 0; s.thumbUrl = entry.thumbUrl;
+            s.prepare = entry.prepare && entry.prepare.state === 'error' ? null : entry.prepare; s.liked = this.store.liked(entry.detailId);
+            s.detailsMusic = entry.detailsMusic; s.resumePosition = this.resumeFor(entry.detailId, entry.details && entry.details.video);
+        }
+        if (entry.screen === 'search') { s.searchFrom = entry.searchFrom || ''; s.searchMode = entry.searchMode || s.searchMode; }
+        if (entry.screen === 'home' && !s.home) { s.screen = 'home'; this.loadHome(this.generation); return; }
+        if (entry.screen === 'music' && !s.musicHome) { s.screen = 'music'; this.loadMusicHome(this.generation); return; }
+        if (entry.screen === 'library') { this.openLibrary(); return; }
+        s.screen = entry.screen;
+        this.render();
+    }
+    resumeFor(id, video) {
+        const history = this.store.state.history.filter(entry => entry.id === id)[0];
+        return history && history.position < ((video && video.duration) || 86400) - 15 ? history.position : 0;
     }
 
     card(s, t) {
@@ -380,11 +489,10 @@ class JiboTubeSkill extends BeSkill {
         this.render();
     }
     shelfAll(s) {
-        this.pageRequestId++; this.state.loading = false;
         const shelf = this.shelves()[s];
         if (!shelf) return;
-        this.state.previous = this.state.screen;
-        this.state.results = { title: shelf.row.title, items: shelf.row.items.slice(), back: true };
+        this.pushScreen();
+        this.state.results = { title: shelf.row.title, items: shelf.row.items.slice(), back: true, music: this.state.screen === 'music' };
         this.state.resultsPage = 0; this.state.screen = 'results';
         this.render();
     }
@@ -413,42 +521,60 @@ class JiboTubeSkill extends BeSkill {
     }
     setSearchMode(mode) {
         this.state.searchMode = mode === 'music' ? 'music' : 'all';
-        if (this.state.screen === 'results' && this.state.query) this.search();
+        if (this.state.screen === 'results' && this.state.query) { this.state.searchBusy = false; this.search(); }
         else this.render();
     }
     musicSearchOpen() {
         this.pageRequestId++; this.state.loading = false;
+        this.pushScreen();
         this.state.searchMode = 'music';
-        this.state.tab = 'search';
+        this.state.searchFrom = 'music';
         this.state.screen = 'search';
         this.state.query = '';
         this.state.status = null;
         this.render();
     }
+    // One search at a time: while it runs, Search shows "Searching…" and is
+    // locked, so a double tap cannot send the same request twice.
     search() {
         const query = String(this.state.query || '').trim();
         if (!query) { this.toast('Type something to search'); return; }
+        if (this.state.searchBusy) return;
         const current = this.pageRequest();
         const music = this.state.searchMode === 'music';
         this.store.search(query);
         this.state.recentSearches = this.store.state.searches.slice(0, 4);
-        this.state.previous = 'search';
-        this.state.results = { title: '“' + query + '”', items: [], back: true, sub: 'Searching…', music: music };
-        this.state.resultsPage = 0; this.state.screen = 'results'; this.state.loading = true;
+        if (this.state.screen === 'search' || this.state.screen === 'voice') this.pushScreen();
+        const token = this.searchToken = (this.searchToken || 0) + 1;
+        this.state.results = { title: '“' + query + '”', query: query, items: [], back: true, music: music };
+        this.state.resultsPage = 0; this.state.screen = 'results'; this.state.loading = true; this.state.searchBusy = true; this.state.status = null;
         this.render();
         const request = music ? this.client.musicSearch(query) : this.client.search(query);
+        const finish = () => { if (token === this.searchToken) this.state.searchBusy = false; };
         request.then(result => {
-            if (!current() || this.state.screen !== 'results' || this.state.results.title !== '“' + query + '”') return;
-            this.state.results = { title: '“' + query + '”', items: (result.items || []).map(item => this.enrich(item, 'mqdefault')),
-                back: true, sub: music ? 'Music' : '', music: music || !!result.music };
+            finish();
+            if (!current() || token !== this.searchToken || this.state.screen !== 'results' || this.state.results.query !== query) return;
+            this.state.results = { title: '“' + query + '”', query: query, items: (result.items || []).map(item => this.enrich(item, 'mqdefault')),
+                back: true, music: music || !!result.music };
             this.state.loading = false;
             this.render();
         }).catch(error => {
-            if (!current()) return;
-            this.state.loading = false;
-            this.state.results = { title: '“' + query + '”', items: [], back: true, sub: music ? 'Music' : '', music: music };
-            this.toast(statusOf(error));
+            finish();
+            if (!current() || token !== this.searchToken || this.state.screen !== 'results' || this.state.results.query !== query) return;
+            this.state.loading = false; this.state.status = this.statusFor(error);
+            this.state.results = { title: '“' + query + '”', query: query, items: [], back: true, music: music,
+                error: this.state.status.code, retryable: this.state.status.retryable };
+            this.render();
         });
+    }
+    // The button under "Nothing found" or a search problem.
+    resultsAction() {
+        const result = this.state.results;
+        if (!result || this.state.loading) return;
+        const note = this.ui && this.ui.frame && this.ui.frame.resultsNote;
+        if (note && note.action === 'close') { this.leave(this.generation); return; }
+        if (note && note.retry && result.query) { this.state.query = result.query; this.state.screen = 'search'; this.state.stack = this.state.stack.slice(0, -1); this.search(); return; }
+        this.back();
     }
 
     page(dir) {
@@ -461,46 +587,42 @@ class JiboTubeSkill extends BeSkill {
         const item = this.state.results && this.state.results.items[(this.state.resultsPage || 0) * 4 + index];
         if (item) this.openVideoById(item.id, item);
     }
+    // The one Back: return to exactly the previous screen. With nothing to go
+    // back to, go to the current tab's top screen (never a dead end).
     back() {
         this.pageRequestId++; this.state.loading = false;
         if (this.state.screen === 'player') { this.playerBack(); return; }
+        if (this.state.screen === 'voice') { this.cancelVoice(true); return; }
         this.cancelVoice(false);
-        if (this.state.screen === 'details') {
-            this.stopVideo('back');
-            this.state.player = null; this.dropOverlay();
-            this.state.screen = this.state.previous || 'home';
-            this.state.status = null;
-            this.render();
-            return;
-        }
-        if (this.state.screen === 'results') {
-            this.state.screen = this.state.previous === 'search' ? 'search' : 'home';
-            this.state.status = null;
-            this.render();
-            return;
-        }
-        this.state.screen = 'home'; this.state.tab = 'home'; this.state.status = null;
-        this.render();
+        if (this.state.screen === 'details') { this.stopVideo('back'); this.state.player = null; this.dropOverlay(); }
+        this.state.searchBusy = false; this.searchToken = (this.searchToken || 0) + 1;
+        const stack = this.state.stack || [];
+        const entry = stack.length ? stack[stack.length - 1] : null;
+        this.state.stack = stack.slice(0, -1);
+        if (entry) { this.restore(entry); return; }
+        const tab = this.state.tab === 'music' ? 'music' : this.state.tab === 'library' ? 'library' : this.state.tab === 'search' ? 'search' : 'home';
+        this.nav(tab === 'search' && this.state.screen === 'search' ? 'home' : tab);
     }
 
-    openVideoById(id, item, autoplay) {
+    openVideoById(id, item, autoplay, reload) {
         if (!id) return;
         const current = this.pageRequest();
-        this.state.loading = false;
+        this.playbackRecovery = null;
         this.cancelVoice(false);
         this.stopVideo('open');
-        this.state.previous = this.state.screen === 'player' ? 'details' : this.state.screen;
-        if (this.state.previous === 'voice') this.state.previous = 'search';
+        // Opening from a list or another video's details remembers where you
+        // were. From the player (Next, autoplay) the finished video's details
+        // are replaced, so Back returns to where the chain began.
+        if (!reload) this.pushScreen();
         this.state.detailId = id; this.state.relatedPage = 0; this.state.liked = this.store.liked(id);
         this.state.captions = []; this.state.captionsFor = '';
         this.state.detailsMusic = !!(item && item.music) || this.state.tab === 'music' || this.state.searchMode === 'music';
         const known = item || { id: id, title: 'Loading video…', channel: '', duration: 0 };
-        this.state.details = { video: this.enrich(known, 'hq720'), related: [], rows: [], sponsor: { enabled: true, segments: [] } };
+        this.state.details = { video: this.enrich(known, 'hq720'), related: [], rows: [], sponsor: { enabled: true, segments: [] }, loaded: false };
         this.state.thumbUrl = this.client.thumb(known, 'hq720');
         this.state.prepare = null; this.state.pendingPlay = !!autoplay;
-        const history = this.store.state.history.filter(entry => entry.id === id)[0];
-        this.state.resumePosition = history && history.position < (known.duration || 86400) - 15 ? history.position : 0;
-        this.state.screen = 'details'; this.state.status = null;
+        this.state.resumePosition = this.resumeFor(id, known);
+        this.state.screen = 'details'; this.state.status = null; this.state.loading = false;
         this.state.player = null; this.dropOverlay();
         this.render();
         this.client.video(id).then(details => {
@@ -508,35 +630,60 @@ class JiboTubeSkill extends BeSkill {
             details.video = this.enrich(details.video, 'hq720');
             details.related = (details.related || []).map(related => this.enrich(related, 'mqdefault'));
             details.rows = (details.rows || []).map(row => Object.assign({}, row, { items: (row.items || []).map(related => this.enrich(related, 'mqdefault')) }));
+            details.loaded = true;
             this.state.details = details;
             this.state.thumbUrl = details.video.thumbUrl;
             this.state.liked = this.store.liked(id);
-            this.state.prepare = { id: id, state: 'ready', cleanDuration: details.video.duration || 0 };
-            const historyItem = this.store.state.history.filter(entry => entry.id === id)[0];
-            this.state.resumePosition = historyItem && historyItem.position < (details.video.duration || 86400) - 15 ? historyItem.position : 0;
-            if (this.state.pendingPlay) { this.state.pendingPlay = false; this.startPlayer(this.state.resumePosition || 0); return; }
+            if (!(this.state.prepare && this.state.prepare.state === 'error')) this.state.prepare = { id: id, state: 'ready', cleanDuration: details.video.duration || 0 };
+            this.state.resumePosition = this.resumeFor(id, details.video);
+            if (this.state.pendingPlay) { this.state.pendingPlay = false; if (!this.playerStarting()) this.startPlayer(this.state.resumePosition || 0); else this.render(); return; }
             this.render();
         }).catch(error => {
-            if (!current() || this.state.detailId !== id) return;
+            if (!current() || this.state.detailId !== id || this.state.screen !== 'details') return;
             this.state.pendingPlay = false;
-            if (autoplay) {
-                this.state.screen = 'home'; this.state.tab = 'home'; this.state.player = null;
-                this.toast('Skipped an unavailable video');
-                this.render();
-                return;
-            }
-            this.toast('Could not load this video');
+            if (this.playerStarting()) return;
+            // The details page itself says what went wrong and what to do.
+            const failure = this.statusFor(error);
+            this.state.status = failure;
+            this.state.prepare = { id: id, state: 'error', stage: 'details', reason: failure.code, message: failure.body };
+            this.render();
         });
     }
 
+    playerStarting() {
+        const player = this.state.player;
+        return !!player && player.starting && player.generation === this.playGeneration;
+    }
+    // Play, or the details page's one next step after a problem: Try again
+    // (only when retryable), Pick another video (back), or Close JiboTube.
     play() {
-        if (!this.state.details) return;
+        if (!this.state.details || this.playerStarting()) return;
+        const job = this.state.prepare;
+        if (job && job.state === 'preparing') return;
+        const detail = this.ui && this.ui.frame && this.ui.frame.screen === 'details' ? this.ui.frame.detail : null;
+        const failed = (job && job.state === 'error') || (detail && detail.error);
+        if (failed) {
+            const action = detail && detail.error ? detail.error.action : statusInfo({ code: job.reason }, 'details').action;
+            if (action === 'close') { this.leave(this.generation); return; }
+            if (action !== 'retry') { this.back(); return; }
+            this.state.status = null;
+            if ((job && job.stage === 'details') || (this.state.details && this.state.details.loaded === false)) {
+                const video = this.state.details.video;
+                this.openVideoById(this.state.detailId, video && video.id ? video : null, false, true);
+                return;
+            }
+            this.state.prepare = { id: this.state.detailId, state: 'ready', cleanDuration: job && job.cleanDuration || 0 };
+        }
+        this.playbackRecovery = null;
         this.state.pendingPlay = false;
         this.startPlayer(this.state.resumePosition || 0);
     }
+    // Like toggles; a quick second tap (a double tap) is not an unlike.
     like() {
         const videoItem = this.state.details && this.state.details.video;
         if (!videoItem) return;
+        if (Date.now() - (this.lastLikeAt || 0) < LIKE_SETTLE_MS) return;
+        this.lastLikeAt = Date.now();
         this.state.liked = this.store.like(Object.assign(itemFor(videoItem), { music: this.state.detailsMusic === true }));
         this.state.library = { history: this.store.state.history.map(item => this.enrich(item, 'mqdefault')),
             likes: this.store.state.likes.map(item => this.enrich(item, 'mqdefault')) };
@@ -558,6 +705,10 @@ class JiboTubeSkill extends BeSkill {
         const details = this.state.details;
         if (!details || !details.video) return;
         const v = details.video;
+        if (this.playbackStartedMono == null) this.playbackStartedMono = monotonic();
+        if (monotonic() - this.playbackStartedMono >= SESSION_LIMIT_MS) {
+            this.stopVideo('session_limit'); this.state.player = null; this.dropOverlay(); this.failStatus({ code: 'session_limit' }); return;
+        }
         const segments = (details.sponsor && details.sponsor.segments) || [];
         const next = (details.related && details.related[0]) || null;
         let target = Math.max(0, Math.min(Math.max(0, (Number(v.duration) || 0) - 1), Number(position) || 0));
@@ -565,16 +716,19 @@ class JiboTubeSkill extends BeSkill {
             if (target >= segments[i].start && target < segments[i].end) { target = segments[i].end; snapAfter = true; break; }
         }
         this.stopVideo('restart');
+        this.dropOverlay();
+        // Why this start happens (seek, resume), for the words on screen.
+        const startText = this.startText || ''; this.startText = '';
         const generation = ++this.playGeneration;
         const player = this.state.player = {
             id: v.id, title: v.title, channel: v.channel || '', duration: Number(v.duration) || 0,
-            base: target, position: target, startedAt: 0, paused: false, starting: true, ended: false, endedAt: 0,
+            base: target, position: target, startedAt: 0, startedMono: null, paused: false, starting: true, ended: false, endedAt: 0,
             autoplay: this.store.state.settings.autoplay !== false, autoplayIn: 0, nextItem: next,
             sponsorCount: segments.length, segments: segments, nextTitle: next ? next.title : '',
-            statusText: 'Buffering…', toast: '', toastUntil: 0, generation: generation, volume: this.volumeLevel(),
+            statusText: startText || 'Buffering…', toast: '', toastUntil: 0, generation: generation, volume: this.volumeLevel(),
             overlayRecoveries: 0, lastStatus: 0, serviceRetried: !!serviceRetried, skipFloor: target, snapAfter: !!snapAfter,
             loop: this.store.state.settings.loop === true, captionsOn: this.store.state.settings.captions === true,
-            captionsAvailable: this.state.captionsFor === v.id && this.state.captions.length > 0,
+            captionsAvailable: this.state.captionsFor === v.id ? this.state.captions.length > 0 : undefined,
             captionText: '', settingsOpen: false, controlsVisible: true, controlsAlpha: 1, controlsAt: Date.now(),
             controlsHideTimer: null, fadeTimer: null
         };
@@ -592,7 +746,7 @@ class JiboTubeSkill extends BeSkill {
             if (info.channel) player.channel = info.channel;
             player.segments = info.segments || segments;
             player.sponsorCount = player.segments.length;
-            player.statusText = 'Starting…';
+            player.statusText = startText || 'Starting…';
             if (this.state.captionsFor !== v.id) {
                 this.client.captions(v.id).then(result => {
                     if (this.state.player !== player) return;
@@ -606,14 +760,19 @@ class JiboTubeSkill extends BeSkill {
             const session = this.session = video.open({
                 url: this.client.streamUrl(info.video),
                 audioUrl: info.audio ? this.client.streamUrl(info.audio) : '',
-                videoMime: info.videoMime, audioMime: info.audioMime, audio: !!info.audio, stage: this.view && this.view.stage, duration: Math.max(0, player.duration - player.base)
+                videoMime: info.videoMime, audioMime: info.audioMime, audio: !!info.audio,
+                stage: this.view && this.view.stage, duration: Math.max(0, player.duration - player.base)
             });
             player.session = session;
             this.overlay.update(session, player, true);
+            this.syncPlayerHitAreas();
             this.store.watched(Object.assign(this.currentItem() || itemFor(v), { duration: player.duration }), player.base);
             session.on('state', event => {
                 if (generation !== this.playGeneration || this.state.player !== player) return;
-                if (event.state === 'visible') {
+                if (event.state === 'starting') {
+                    // The texture has joined the scene: raise the startup controls above it.
+                    this.overlay.reset(); this.overlay.update(session, player, true);
+                } else if (event.state === 'visible') {
                     player.starting = false;
                     this.holdFace(false);
                     this.overlay.update(session, player, true);
@@ -624,23 +783,26 @@ class JiboTubeSkill extends BeSkill {
                     // or the video plays under a paused UI.
                     if (player.paused) { session.pause(); this.overlay.update(session, player, true); return; }
                     player.controlsAt = Date.now();
-                    if (!player.startedAt) { player.startedAt = Date.now(); }
+                    if (!player.startedAt) { player.startedAt = Date.now(); player.startedMono = monotonic(); }
+                    this.syncPlayerHitAreas();
                     this.overlay.update(session, player, true);
                 } else if (event.state === 'buffering') {
                     player.starting = true; player.statusText = 'Buffering…';
                     if (this.overlay) this.overlay.update(session, player, true);
+                    this.syncPlayerHitAreas();
                 } else if (event.state === 'ended') {
                     this.endPlayer(player);
                 } else if (event.state === 'stopped') {
                     this.holdFace(false);
+                    player.position = Math.max(player.position || 0, player.base + (Number(event.position) || 0));
                     player.session = null;
                     if (this.session === session) this.session = null;
                     if (this.state.player !== player) return;
                     if (/^interrupted/.test(event.reason || '')) { this.leave(this.generation); return; }
-                    if (/^restart|request$/.test(event.reason || '')) return;
-                    if (event.error && (player.starting || event.reason !== 'player_exit')) { this.playbackFailed(player, diagnostics.message(event.error)); return; }
+                    if (/^(restart|request|user|open|nav|ended|close|leave|playback_failed)$/.test(event.reason || '')) return;
                     if (event.reason === 'player_exit') { this.playerExited(player); return; }
-                    if (event.reason === 'host_exit' || event.reason === 'play_error') { this.playbackFailed(player, 'Playback stopped'); return; }
+                    if (event.confirmed === false) { this.playbackFailed(player, null, 'teardown_unconfirmed'); return; }
+                    if (/^(host_exit|host_unavailable|play_error|playback_stalled|window_timeout|start_failed|playback_failed)$/.test(event.reason || '')) { this.playerExited(player, this.mediaFailureCode(event.error || player.lastError || { reason: event.reason })); return; }
                     if (!player.ended && !player.paused) { player.paused = true; player.position = this.playerPosition(player); this.overlay.update(session, player, true); }
                 }
             });
@@ -649,9 +811,8 @@ class JiboTubeSkill extends BeSkill {
                 // A transient branch error (for example the audio socket) should
                 // not tear down a video that is still playing.
                 if (!player.errorHandled) {
-                    player.errorHandled = true;
-                    player.lastError = event;
-                    player.toast = diagnostics.message(event);
+                    player.errorHandled = true; player.lastError = event;
+                    player.toast = 'Playback issue';
                     player.toastUntil = Date.now() + 4000;
                 }
                 if (this.overlay) this.overlay.update(session, player, true);
@@ -661,23 +822,31 @@ class JiboTubeSkill extends BeSkill {
             if (generation !== this.playGeneration || this.state.player !== player) return;
             // The service answered but cannot stream this video (for example a
             // just-ended live stream, which YouTube serves without an index).
-            if (error && error.code === 'stream_unavailable') { this.playbackFailed(player, "This video can't be played on Jibo"); return; }
-            if (player.serviceRetried) { this.playbackFailed(player, 'Could not start playback'); return; }
+            const failure = this.statusFor(error);
+            if (!failure.retryable || (error && error.code && ['network_unavailable', 'timeout', 'service_unavailable', 'unauthorized'].indexOf(error.code) < 0)) { this.playbackFailed(player, null, failure); return; }
+            if (player.serviceRetried) { this.playbackFailed(player, null, failure); return; }
             player.serviceRetried = true;
             player.statusText = 'Starting the local service…';
             this.render();
-            ServiceModule.ensure(this.client.settings).then(ok => {
+            return ServiceModule.ensure(this.client.settings).then(ok => {
                 if (generation !== this.playGeneration || this.state.player !== player) return;
                 if (ok) this.startPlayer(target, true, snapAfter);
-                else this.playbackFailed(player, 'Could not start playback');
-            });
+                else this.playbackFailed(player, null, 'service_unavailable');
+            }).catch(() => { if (generation === this.playGeneration && this.state.player === player) this.playbackFailed(player, null, 'service_unavailable'); });
         });
     }
     playerPosition(player) {
-        if (player.paused || player.ended) return Math.max(0, Math.min(player.duration, player.position || 0));
-        if (player.session && typeof player.session.position === 'function') return Math.max(0, Math.min(player.duration, player.base + player.session.position()));
-        if (!player.startedAt) return player.base || 0;
-        return Math.max(0, Math.min(player.duration, (player.base || 0) + (Date.now() - player.startedAt) / 1000));
+        if (player.paused || player.ended || !player.session) return Math.max(0, Math.min(player.duration, player.position || player.base || 0));
+        return Math.max(0, Math.min(player.duration, player.base + player.session.position()));
+    }
+    mediaFailureCode(error) {
+        const reason = error && error.reason || '';
+        if (reason === 'media_4' || /unsupported_stream_codec/.test(error && error.detail || '')) return 'unsupported_format';
+        if (reason === 'media_3') return 'unsupported_format';
+        if (reason === 'media_timeout') return 'timeout';
+        if (/media_2|media_buffer/.test(reason)) return 'network_unavailable';
+        if (reason === 'playback_stalled') return 'playback_stalled';
+        return 'playback_failed';
     }
     clearPlayerTimers(player) {
         if (!player) return;
@@ -692,6 +861,7 @@ class JiboTubeSkill extends BeSkill {
         if (player.fadeTimer) { timers.clearTimeout(player.fadeTimer); player.fadeTimer = null; }
         player.controlsVisible = true; player.controlsAlpha = 1; player.controlsAt = Date.now();
         player.overlayWarned = false; player.overlayRecoveries = 0;
+        if (player.toast === HINT) { player.toast = ''; player.toastUntil = 0; }
         if ((force || !wasVisible) && this.overlay && player.session) this.overlay.update(player.session, player, true);
         this.syncPlayerHitAreas();
     }
@@ -702,18 +872,22 @@ class JiboTubeSkill extends BeSkill {
     }
     hideControls() {
         const player = this.state.player;
-        if (!player || !player.controlsVisible || player.settingsOpen || player.paused || player.ended) return;
+        if (!player || !player.controlsVisible || player.settingsOpen || player.paused || player.ended || player.starting) return;
         // No intermediate fade frame: each one redrew every control layer.
         player.controlsAlpha = 1; player.controlsVisible = false;
+        // The first time they hide, say how to bring them back.
+        if (!player.hinted) { player.hinted = true; player.toast = HINT; player.toastUntil = Date.now() + 3500; }
         if (this.overlay && player.session) this.overlay.update(player.session, player, false);
         this.syncPlayerHitAreas();
     }
+    // A tap on the picture only shows or hides the controls; it never starts,
+    // pauses or seeks (the big Play/Pause button does that).
     screenTap() {
         const player = this.state.player;
         if (!player) return;
         if (player.settingsOpen) { this.closeSettings(); return; }
         if (!player.controlsVisible) { this.showControls(); return; }
-        this.togglePlay();
+        this.hideControls();
     }
     toggleSettings() {
         const player = this.state.player;
@@ -791,12 +965,7 @@ class JiboTubeSkill extends BeSkill {
         if (this.overlay && player.session) this.overlay.update(player.session, player, true);
     }
 
-    // The face renderer redraws its stage every frame even under a fullscreen
-    // video, about half a CPU core the decoder needs on a busy robot. Playback
-    // pauses it; stopVideo (every teardown) and a per-tick check restore it.
-    // It still ticks at FACE_HELD_MS so touch hit-testing (which uses the
-    // transforms an update computes), gestures and tweens keep working: a full
-    // pause left controls that appear during playback unreachable.
+    // Texture playback keeps the face renderer active; teardown restores any prior hold.
     holdFace(hold) {
         const face = jibo.face;
         if (!face || !!this.faceHeld === !!hold) return;
@@ -831,7 +1000,7 @@ class JiboTubeSkill extends BeSkill {
     }
     togglePlay() {
         const player = this.state.player;
-        if (!player) return;
+        if (!player || this.playerStarting()) return;
         this.touchControls(false);
         if (player.ended) { this.replay(); return; }
         if (player.paused) this.resumePlayer();
@@ -846,13 +1015,15 @@ class JiboTubeSkill extends BeSkill {
         this.touchControls(false);
         this.store.watched(Object.assign(this.currentItem() || itemFor(this.state.details.video), { duration: player.duration }), player.position);
         if (this.overlay) this.overlay.update(player.session, player, true);
+        this.syncPlayerHitAreas();
     }
     resumePlayer() {
         const player = this.state.player;
-        if (!player || !player.paused) return;
-        player.paused = false; player.statusText = 'Resuming…';
-        if (player.session) { player.session.show(); }
-        else { this.startPlayer(player.position); }
+        if (!player || !player.paused || this.playerStarting()) return;
+        player.paused = false; this.touchControls(true);
+        if (player.session) player.session.show();
+        else this.startPlayer(player.position);
+        this.syncPlayerHitAreas();
     }
     seek(delta) {
         const player = this.state.player;
@@ -867,9 +1038,10 @@ class JiboTubeSkill extends BeSkill {
     }
     seekToTime(position, snapAfter) {
         const player = this.state.player;
-        if (!player) return;
+        if (!player || this.playerStarting()) return;
         player.position = position; player.paused = false; player.starting = true; player.ended = false;
         player.statusText = 'Seeking…';
+        this.startText = 'Seeking…';
         this.startPlayer(position, false, snapAfter);
     }
     next() {
@@ -878,20 +1050,27 @@ class JiboTubeSkill extends BeSkill {
         if (player.nextItem) this.openVideoById(player.nextItem.id, player.nextItem, true);
         else this.toast('No next video');
     }
-    // The player also exits when its stream breaks off. Only an exit near the
-    // end is the end; otherwise reconnect once at the current position (not
-    // again within 30 s), so a hiccup never skips to the next video.
-    playerExited(player) {
-        const at = this.playerPosition(player);
-        if (!player.duration || at >= player.duration - 10) { this.endPlayer(player); return; }
-        const last = this.lastRecovery;
-        if (player.starting || (last && last.id === player.id && Date.now() - last.at < 30000)) {
-            this.playbackFailed(player, player.lastError ? diagnostics.message(player.lastError) : 'Playback stopped');
-            return;
-        }
-        this.lastRecovery = { id: player.id, at: Date.now() };
-        this.startPlayer(at);
-        if (this.state.player) { this.state.player.statusText = 'Reconnecting…'; this.render(); }
+    // Recover only after confirmed old-session teardown, once for this video
+    // attempt. Elapsed wall time never replenishes the automatic retry budget.
+    playerExited(player, code) {
+        this.recoverPlayer(player, code || 'playback_failed');
+    }
+    recoverPlayer(player, code) {
+        if (!this.state || this.state.player !== player || this.leaving) return;
+        const recovery = this.playbackRecovery;
+        if (!this.statusFor({ code: code }).retryable || (recovery && recovery.id === player.id && recovery.used)) { this.playbackFailed(player, null, code); return; }
+        this.playbackRecovery = { id: player.id, used: true };
+        const at = this.playerPosition(player), generation = this.playGeneration;
+        player.starting = true; player.statusCode = 'reconnecting'; player.statusText = 'Reconnecting once…';
+        this.holdFace(false); this.clearPlayerTimers(player); this.render();
+        const session = this.session || player.session;
+        this.session = null; player.session = null;
+        Promise.resolve().then(() => session ? session.stop('restart') : null).then(result => {
+            if (result && result.confirmed === false) throw Error('teardown_unconfirmed');
+            if (this.leaving || generation !== this.playGeneration || this.state.player !== player) return;
+            this.startPlayer(at);
+            if (this.state.player) { this.state.player.statusCode = 'reconnecting'; this.state.player.statusText = 'Reconnecting once…'; this.render(); }
+        }).catch(() => { if (this.state.player === player) this.playbackFailed(player, null, 'teardown_unconfirmed'); });
     }
     endPlayer(player) {
         if (!player || player.ended) return;
@@ -907,7 +1086,8 @@ class JiboTubeSkill extends BeSkill {
     }
     replay() {
         const player = this.state.player;
-        if (!player) return;
+        if (!player || this.playerStarting()) return;
+        this.playbackRecovery = null;
         player.ended = false; player.endedAt = 0; player.autoplayIn = 0;
         this.startPlayer(0);
     }
@@ -918,6 +1098,7 @@ class JiboTubeSkill extends BeSkill {
         this.touchControls(true);
         this.render();
     }
+    // Leaving the player returns to its video's details; nothing is lost.
     playerBack() {
         const player = this.state.player;
         this.clearPlayerTimers(player);
@@ -926,11 +1107,13 @@ class JiboTubeSkill extends BeSkill {
         this.state.player = null; this.dropOverlay();
         this.state.screen = 'details';
         this.state.status = null;
+        if (this.state.detailId) this.state.resumePosition = this.resumeFor(this.state.detailId, this.state.details && this.state.details.video);
         this.render();
     }
+    // From the finished screen: the next video's details replace this one.
     playNext() {
         const player = this.state.player;
-        if (player && player.nextItem) this.openVideoById(player.nextItem.id, player.nextItem, true);
+        if (player && player.nextItem) this.openVideoById(player.nextItem.id, player.nextItem, true, true);
     }
 
     skipSponsor(player) {
@@ -951,19 +1134,26 @@ class JiboTubeSkill extends BeSkill {
         }
     }
 
-    playbackFailed(player, message) {
+    // A playback problem returns to the video's details, which show what
+    // happened and the one next step (state.prepare + state.status).
+    playbackFailed(player, message, code) {
         if (!this.state || this.state.player !== player) return;
         this.clearPlayerTimers(player);
+        const at = this.playerPosition(player);
+        if (this.state.details) this.store.watched(Object.assign(this.currentItem() || itemFor(this.state.details.video), { duration: player.duration }), at);
+        this.state.resumePosition = at;
         this.stopVideo('playback_failed');
         this.state.player = null; this.dropOverlay();
         this.state.screen = 'details';
-        this.toast(message || 'Playback stopped');
+        this.state.status = this.statusFor(typeof code === 'object' ? code : { code: code || 'playback_failed' });
+        this.state.prepare = { id: this.state.detailId, state: 'error', stage: 'play', reason: this.state.status.code, message: this.state.status.body };
         this.render();
     }
 
     updatePlayer() {
         const player = this.state.player;
         if (!player) return;
+        if (this.playbackStartedMono != null && monotonic() - this.playbackStartedMono >= SESSION_LIMIT_MS) { this.playbackFailed(player, null, 'session_limit'); return; }
         if (!player.paused && !player.ended && !player.starting) {
             player.position = this.playerPosition(player);
             if (player.position >= player.duration - 0.35) { this.endPlayer(player); return; }
@@ -979,7 +1169,7 @@ class JiboTubeSkill extends BeSkill {
         this.updateCaption(player);
         this.skipSponsor(player);
         if (player.controlsVisible && !player.settingsOpen && !player.paused && !player.starting &&
-            Date.now() - (player.controlsAt || 0) > 4000) this.hideControls();
+            Date.now() - (player.controlsAt || 0) > 5000) this.hideControls();
         if (player.session && Date.now() - (player.lastStatus || 0) > 2000) { player.lastStatus = Date.now(); player.session.status(); }
         if (this.overlay && player.session) this.overlay.update(player.session, player, false);
     }
@@ -987,14 +1177,13 @@ class JiboTubeSkill extends BeSkill {
     tick(generation) {
         if (this.faceHeld && (!this.session || !this.state || this.state.screen !== 'player')) this.holdFace(false);
         if (!this.opened || this.leaving || generation !== this.generation) return;
+        if (this.store && this.store.lastError && !this.state.storageWarning) { this.state.storageWarning = 'storage_unavailable'; this.toast(this.statusFor({ code: 'storage_unavailable' }).body); }
+        else if (this.store && !this.store.lastError) this.state.storageWarning = null;
         if (this.state.screen === 'voice') {
             this.render(); return;
         }
         if (this.state.screen === 'player') { this.updatePlayer(); this.syncPlayerHitAreas(); return; }
         if (Date.now() - this.lastRender > 900) this.render();
-        if (this.state.libConfirm && !this.libConfirmTimer) {
-            this.libConfirmTimer = timers.setTimeout(() => { this.libConfirmTimer = null; this.state.libConfirm = false; this.render(); }, 3500);
-        }
     }
 
     voice() {
@@ -1049,20 +1238,38 @@ class JiboTubeSkill extends BeSkill {
         }
     }
 
+    // Clear history asks first, on its own panel with Clear and Keep buttons
+    // in a different place. Clear only works after a short pause, so the
+    // second tap of a double tap cannot clear by accident.
     clearHistory() {
-        if (!this.state.libConfirm) {
-            this.state.libConfirm = true;
-            this.render();
-            return;
-        }
+        if (this.state.libConfirm) return;
+        this.state.libConfirm = true; this.state.libConfirmAt = Date.now();
+        this.render();
+        const generation = this.generation;
+        if (this.libConfirmTimer) timers.clearTimeout(this.libConfirmTimer);
+        this.libConfirmTimer = timers.setTimeout(() => { this.libConfirmTimer = null; if (generation === this.generation && this.state && this.state.libConfirm) this.render(); }, 650);
+    }
+    confirmClearHistory() {
+        if (!this.state.libConfirm || Date.now() - (this.state.libConfirmAt || 0) < 600) return;
         this.state.libConfirm = false;
         this.store.clearHistory();
         this.state.library = { history: [], likes: this.store.state.likes.slice() };
-        this.toast('History cleared');
+        this.toast('Watch history cleared');
+        this.openLibrary();
+    }
+    cancelClearHistory() {
+        if (!this.state.libConfirm) return;
+        this.state.libConfirm = false;
         this.render();
     }
+    // The full-screen problem's one button: Try again (only if retryable),
+    // Back, or Close JiboTube.
     statusAction() {
-        if (this.state.screen === 'error') this.retry();
+        const f = this.ui && this.ui.frame;
+        const action = f && f.status ? f.status.action : '';
+        if (action === 'close') { this.leave(this.generation); return; }
+        if (action === 'back') { this.state.status = null; this.back(); return; }
+        if (action === 'retry' && this.state.screen === 'error') this.retry();
     }
 
     leave(generation) {
@@ -1085,6 +1292,7 @@ class JiboTubeSkill extends BeSkill {
         this.cancelVoice(false); this.stopVoiceTimer();
         this.events.forEach(off => { try { off(); } catch (_) {} }); this.events = [];
         if (this.tickTimer) { timers.clearInterval(this.tickTimer); this.tickTimer = null; }
+        this.stopBusyTimer();
         if (this.libConfirmTimer) { timers.clearTimeout(this.libConfirmTimer); this.libConfirmTimer = null; }
         if (this.volumeApplyTimer) { timers.clearTimeout(this.volumeApplyTimer); this.volumeApplyTimer = null; }
         if (this.volumeRetryTimer) { timers.clearTimeout(this.volumeRetryTimer); this.volumeRetryTimer = null; }
@@ -1092,20 +1300,24 @@ class JiboTubeSkill extends BeSkill {
         this.volumeTarget = null;
         const closing = this.closing = { callbacks: [done], finished: false, error: null };
         const view = this.view, views = jibo.face && jibo.face.views, ui = this.ui;
-        this.stopVideo('close').then(() => Promise.all([video.shutdown(), ServiceModule.stop()])).then(() => {
-            this.dropOverlay();
-            if (ui) ui.releaseArt();
+        const errors = [];
+        const attempt = work => Promise.resolve().then(work).catch(error => { errors.push(error); });
+        // Every owned cleanup is attempted, even if an earlier one failed.
+        // Failure is preserved; a removed view is not proof a child exited.
+        Promise.all([attempt(() => this.stopVideo('close')), attempt(() => video.shutdown()), attempt(() => ServiceModule.stop())]).then(() => {
+            this.holdFace(false); this.dropOverlay();
+            try { if (ui) ui.releaseArt(); } catch (error) { errors.push(error); }
             lifecycle.closeView(views, jibo.face && jibo.face.tween, view, timers, 'jibotube', error => {
-                closing.finished = true; closing.error = error;
+                closing.finished = true; closing.error = errors[0] || error || null;
                 if (!error) { this.view = null; this.ui = null; }
                 const callbacks = closing.callbacks; closing.callbacks = [];
-                callbacks.forEach(callback => callback(error));
+                callbacks.forEach(callback => callback(closing.error));
             });
         }).catch(error => {
             this.holdFace(false); this.dropOverlay();
-            closing.finished = true; closing.error = error;
+            closing.finished = true; closing.error = errors[0] || error;
             const callbacks = closing.callbacks; closing.callbacks = [];
-            callbacks.forEach(callback => callback(error));
+            callbacks.forEach(callback => callback(closing.error));
         });
     }
     destroy(done) { this.close(error => super.destroy(baseError => done(error || baseError))); }

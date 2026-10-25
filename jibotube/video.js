@@ -8,12 +8,16 @@ const BufferedMedia = require('./buffered-media');
 const videoFrames = require('./video-frames');
 let currentSession = null;
 const START_BUFFER_SECONDS = 3, REBUFFER_SECONDS = 5;
+const START_TIMEOUT_MS = 25000, STALL_TIMEOUT_MS = 15000;
+function monotonic() { const t = process.hrtime(); return t[0] * 1000 + t[1] / 1e6; }
 const INTERRUPTS = [['jetstream', 'hjHeard'], ['jetstream', 'localTurnStarted'], ['jetstream', 'globalTurnStarted'], ['jetstream', 'skillSwitch'], ['system', 'touchOn'], ['system', 'hatchOpen']];
 class Session extends EventEmitter {
     constructor(options) {
         super();
         this.options = options; this.state = 'starting'; this.stopped = false;
         this.detach = []; this.elements = []; this.wantPause = false;
+        this.now = options.now || monotonic; this.hasPlayed = false; this.lastPosition = 0; this.lastFrames = null;
+        this.startAt = this.lastProgress = this.now();
         this.bufferGoal = START_BUFFER_SECONDS; this.rebuffering = false; this.playAttempt = 0;
         // Defer setup so the owner can subscribe to error/state first.
         this.startTimer = timers.setTimeout(() => this.start(), 0);
@@ -57,6 +61,7 @@ class Session extends EventEmitter {
             this.texture = new PIXI.Texture(this.baseTexture);
             this.sprite = new PIXI.Sprite(this.texture); this.sprite.interactive = false;
             this.container.addChild(this.sprite); stage.addChild(this.container);
+            this.stateChanged('starting');
             this.elements.forEach(element => {
                 this.listen(element, 'loadeddata', () => { this.fit(); this.tryPlay(); });
                 this.listen(element, 'canplay', () => this.tryPlay());
@@ -77,7 +82,7 @@ class Session extends EventEmitter {
             });
             this.listen(this.media, 'playing', () => {
                 if (!this.active() || this.wantPause || this.rebuffering) return;
-                timers.clearTimeout(this.loadTimer); this.loadTimer = null;
+                if (!this.hasPlayed) { this.hasPlayed = true; this.lastProgress = this.now(); }
                 this.stateChanged('playing');
             });
             this.listen(this.media, 'ended', () => {
@@ -87,7 +92,6 @@ class Session extends EventEmitter {
             this.listen(this.media, 'loadedmetadata', () => this.fit());
             if (this.options.interrupts !== false) this.watchInterrupts();
             this.syncTimer = timers.setInterval(() => this.sync(), 500);
-            this.loadTimer = timers.setTimeout(() => this.startupTimeout(), 25000);
             if (this.options.videoMime) {
                 this.bufferedMedia = new BufferedMedia(this.media, this.options, (reason, detail) => this.fail(reason, detail));
             } else {
@@ -157,7 +161,16 @@ class Session extends EventEmitter {
             if (this.active() && !this.wantPause && (!error || error.name !== 'AbortError')) this.fail('media_play', error && error.message || 'Media play failed');
         });
     }
+    watchProgress() {
+        if (!this.active() || this.wantPause || this.state === 'ended' || !this.media) return;
+        const now = this.now(), position = this.position(), frames = this.media.webkitDecodedFrameCount;
+        const advanced = position > this.lastPosition + 0.01 && (typeof frames !== 'number' || this.lastFrames == null || frames > this.lastFrames);
+        if (advanced) { this.lastProgress = now; this.lastPosition = position; this.lastFrames = typeof frames === 'number' ? frames : null; }
+        if (!this.hasPlayed && now - this.startAt >= START_TIMEOUT_MS) this.startupTimeout();
+        else if (this.hasPlayed && now - this.lastProgress >= STALL_TIMEOUT_MS) this.fail('playback_stalled', 'Playback stopped making progress');
+    }
     sync() {
+        this.watchProgress();
         if (!this.active() || this.wantPause) return;
         if (this.state === 'buffering' || this.state === 'starting' || this.state === 'paused') { this.tryPlay(); return; }
         if (!this.audio || this.state !== 'playing' || this.media.paused || this.audio.paused) return;
@@ -174,7 +187,7 @@ class Session extends EventEmitter {
         if (this.audio) this.audio.playbackRate = 1;
         this.stateChanged('paused'); return this;
     }
-    show() { this.wantPause = false; this.tryPlay(); return this; }
+    show() { this.wantPause = false; this.startAt = this.lastProgress = this.now(); this.tryPlay(); return this; }
     hide() { return this.pause(); }
     status() { return this; }
     // Existing control sprites already sit above the texture; no X window holes.
@@ -197,8 +210,9 @@ class Session extends EventEmitter {
     }
     stop(reason) {
         if (this.stopped) return Promise.resolve();
+        const position = this.position();
         this.stopped = true;
-        timers.clearTimeout(this.startTimer); timers.clearTimeout(this.loadTimer); timers.clearInterval(this.syncTimer);
+        timers.clearTimeout(this.startTimer); timers.clearInterval(this.syncTimer);
         this.detach.forEach(off => { try { off(); } catch (_) {} }); this.detach = [];
         if (this.stopFrames) { this.stopFrames(); this.stopFrames = null; }
         if (this.bufferedMedia) { this.bufferedMedia.close(); this.bufferedMedia = null; }
@@ -214,7 +228,7 @@ class Session extends EventEmitter {
         if (this.mount && this.mount.parentNode) this.mount.parentNode.removeChild(this.mount);
         this.container = this.sprite = this.texture = this.baseTexture = this.mount = this.media = this.audio = null;
         if (currentSession === this) currentSession = null;
-        this.state = 'stopped'; this.emit('state', { state: 'stopped', reason: reason || 'request', error: this.lastError || null });
+        this.state = 'stopped'; this.emit('state', { state: 'stopped', reason: reason || 'request', error: this.lastError || null, position: position });
         return Promise.resolve();
     }
 }

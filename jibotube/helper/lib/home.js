@@ -290,7 +290,9 @@ function _details() {
     let related = yield relatedApi.related(id);
     if (!related.length) {
       const words = tokens(info.title).slice(0, 4).join(' ');
-      related = yield yt.search(words || info.channel || 'popular', 16);
+      // Recommendations are optional; a failed search must not veto the
+      // independently fetched playable video (including Library/Resume).
+      related = yield yt.search(words || info.channel || 'popular', 16).catch(() => []);
     }
     const segments = yield sponsor.segments(id, info.duration);
     const rows = [];

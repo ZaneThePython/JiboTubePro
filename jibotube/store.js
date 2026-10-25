@@ -39,14 +39,18 @@ function itemOf(value) {
     };
 }
 
-function Store() { this.state = this.read(); }
+function Store() { this.lastError = null; this.state = this.read(); }
 
 Store.prototype.defaults = function () {
     return { v: 1, history: [], likes: [], searches: [], settings: { autoplay: true, loop: false, captions: false } };
 };
 Store.prototype.read = function () {
     let parsed;
-    try { parsed = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch (_) { return this.defaults(); }
+    try {
+        const stat = fs.lstatSync(FILE);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 512 * 1024) return this.defaults();
+        parsed = JSON.parse(fs.readFileSync(FILE, 'utf8'));
+    } catch (_) { return this.defaults(); }
     if (!parsed || typeof parsed !== 'object') return this.defaults();
     const state = this.defaults();
     if (Array.isArray(parsed.history)) state.history = parsed.history.map(itemOf).filter(Boolean).slice(0, MAX_HISTORY);
@@ -67,13 +71,13 @@ Store.prototype.read = function () {
     return state;
 };
 Store.prototype.save = function () {
+    const temporary = FILE + '.tmp-' + process.pid;
     try {
         ensureDirectory(DIRECTORY);
-        const temporary = FILE + '.tmp-' + process.pid;
         fs.writeFileSync(temporary, JSON.stringify(this.state) + '\n', { mode: 384 });
         fs.renameSync(temporary, FILE);
-        return true;
-    } catch (_) { return false; }
+        this.lastError = null; return true;
+    } catch (_) { try { fs.unlinkSync(temporary); } catch (ignored) {} this.lastError = 'storage_unavailable'; return false; }
 };
 Store.prototype.watched = function (item, position) {
     const value = itemOf(Object.assign({}, item, { position: position, at: Date.now() }));

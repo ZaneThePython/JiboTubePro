@@ -91,7 +91,7 @@ Promise.resolve().then(() => {
     console.log('PASS native view ownership, concurrent close, voice cancellation, face restore, reopen, swipe exit');
     return require('./navigation')(Skill).then(() => {
         console.log('PASS late page success/failure, repeated Home requests, search mode changes, and stale autoplay');
-        return require('./video')();
+        return require('./upgrade')(load).then(() => require('./transport')(load)).then(() => require('./video')());
     });
 }).then(() => {
     console.log('PASS Recipes-style media playback, synchronization, interruption, errors, and cleanup');

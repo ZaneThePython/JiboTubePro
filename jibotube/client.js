@@ -10,6 +10,44 @@ const url = require('url');
 const CONFIG = path.join(require('./paths').dataRoot(), 'client.json');
 const TIMEOUT_MS = 40000;
 const MAX_BYTES = 4 * 1024 * 1024;
+const nodeTimers = require('timers');
+const STATUS = {
+    timeout: ['That took too long. Try again.', true],
+    network_unavailable: ["Couldn't connect. Check your connection and try again.", true],
+    provider_busy: ['The video service is busy. Wait a moment and try again.', true],
+    provider_unavailable: ["The video service isn't available right now. Try again later.", true],
+    provider_changed: ['The video service changed its response. Try another video.', false],
+    age_restricted: ["This video needs an account and can't play here.", false],
+    region: ["This video isn't available in your region.", false],
+    members_only: ["This video is for members and can't play here.", false],
+    unavailable: ["This video isn't available.", false],
+    unsupported_live: ["Live and upcoming videos can't play here.", false],
+    video_too_long: ['This video is too long to play here.', false],
+    unsupported_format: ['This video has no format Jibo can play.', false],
+    audio_missing: ['This video has no audio format Jibo can play.', false],
+    host_unavailable: ["The video player couldn't start. Try again.", true],
+    start_failed: ["The video player couldn't start. Try again.", true],
+    window_timeout: ["The video display didn't open. Try again.", true],
+    playback_stalled: ['Playback lost its connection. Try again.', true],
+    playback_failed: ['Playback stopped. Try again or choose another video.', true],
+    session_limit: ['JiboTube stopped after a long session. Close and reopen to keep watching.', false],
+    storage_unavailable: ["Changes couldn't be saved. Playback can continue.", true],
+    service_unavailable: ["JiboTube's local service couldn't start. Close and try again.", true],
+    unauthorized: ["JiboTube couldn't connect to its local service. Close and reopen it.", true],
+    teardown_unconfirmed: ["JiboTube couldn't finish closing. Close it and try again.", false]
+};
+function status(error) {
+    let code = error && (error.code || error.message) || 'service_unavailable';
+    const aliases = { stream_unavailable: 'unsupported_format', video_unavailable: 'unavailable', bad_response: 'provider_changed',
+        bad_json: 'provider_changed', response_too_large: 'provider_changed', range_timeout: 'timeout', host_exit: 'playback_failed',
+        play_error: 'playback_failed', player_exit: 'playback_failed', player: 'playback_failed' };
+    if (/stop_unconfirmed|^jibotube_view_/.test(code)) code = 'teardown_unconfirmed';
+    code = aliases[code] || code;
+    if (!Object.prototype.hasOwnProperty.call(STATUS, code)) code = 'service_unavailable';
+    return { code: code, title: code === 'storage_unavailable' ? 'Could not save changes' : 'JiboTube', body: STATUS[code][0],
+        retryable: error && typeof error.retryable === 'boolean' ? error.retryable : STATUS[code][1], action: STATUS[code][1] ? 'Try again' : '' };
+}
+function failure(code) { const e = new Error(code); e.code = code; return e; }
 
 function isLocal(base) {
     try {
@@ -29,48 +67,59 @@ function readConfig() {
 function request(settings, method, pathname, body, timeoutMs, owner) {
     return new Promise(function (resolve, reject) {
         if (owner && owner.closed) return;
-        const pass = resolve, fail = reject;
-        resolve = function (value) { if (!owner || !owner.closed) pass(value); };
-        reject = function (error) { if (!owner || !owner.closed) fail(error); };
-        const target = url.parse(settings.base + pathname);
-        const transport = target.protocol === 'https:' ? https : http;
-        const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
-        const headers = { 'Accept': 'application/json', 'X-JiboTube-Token': settings.token };
-        if (payload) { headers['Content-Type'] = 'application/json'; headers['Content-Length'] = payload.length; }
-        const req = transport.request({
-            protocol: target.protocol, hostname: target.hostname, port: target.port || (target.protocol === 'https:' ? 443 : 80),
-            path: target.path, method: method, headers: headers
-        }, function (response) {
-            const chunks = [];
-            let size = 0;
-            response.on('data', function (chunk) {
-                size += chunk.length;
-                if (size > MAX_BYTES) { req.abort(); reject(new Error('response_too_large')); return; }
-                chunks.push(chunk);
-            });
-            response.on('end', function () {
-                let value;
-                try { value = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-                catch (_) { reject(new Error('bad_response')); return; }
-                if (response.statusCode < 200 || response.statusCode >= 300) {
-                    const error = new Error(value && value.error || ('http_' + response.statusCode));
-                    error.code = value && value.error;
-                    error.status = response.statusCode;
-                    error.payload = value;
-                    reject(error);
-                    return;
-                }
-                resolve(value);
-            });
-        });
-        if (owner) {
-            owner.requests.push(req);
-            req.on('close', function () { const index = owner.requests.indexOf(req); if (index >= 0) owner.requests.splice(index, 1); });
+        if (owner && owner.requests.length >= 8) { reject(failure('provider_busy')); return; }
+        let req = null, response = null, done = false, deadline = null;
+        function finish(error, value) {
+            if (done) return; done = true;
+            nodeTimers.clearTimeout(deadline);
+            if (owner && req) { const i = owner.requests.indexOf(req); if (i >= 0) owner.requests.splice(i, 1); }
+            if (error) { if (req) req.abort(); if (response) response.destroy(); }
+            if (owner && owner.closed) return;
+            if (error) reject(error); else resolve(value);
         }
-        req.setTimeout(timeoutMs || TIMEOUT_MS, function () { req.abort(); reject(new Error('timeout')); });
-        req.on('error', function (error) { reject(error); });
-        if (payload) req.write(payload);
-        req.end();
+        try {
+            const target = url.parse(settings.base + pathname);
+            const transport = target.protocol === 'https:' ? https : http;
+            const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
+            const headers = { 'Accept': 'application/json', 'X-JiboTube-Token': settings.token };
+            if (payload) { headers['Content-Type'] = 'application/json'; headers['Content-Length'] = payload.length; }
+            req = transport.request({ protocol: target.protocol, hostname: target.hostname,
+                port: target.port || (target.protocol === 'https:' ? 443 : 80), path: target.path, method: method, headers: headers
+            }, function (res) {
+                response = res;
+                const chunks = []; let size = 0;
+                res.on('data', function (chunk) {
+                    if (done) return;
+                    size += chunk.length;
+                    if (size > MAX_BYTES) { finish(failure('provider_changed')); return; }
+                    chunks.push(chunk);
+                });
+                res.on('aborted', function () { finish(failure('network_unavailable')); });
+                res.on('error', function () { finish(failure('network_unavailable')); });
+                res.on('end', function () {
+                    if (done) return;
+                    let value;
+                    try { value = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+                    catch (_) { finish(failure('provider_changed')); return; }
+                    if (!value || typeof value !== 'object') { finish(failure('provider_changed')); return; }
+                    if (res.statusCode < 200 || res.statusCode >= 300) {
+                        const error = failure(status({ code: value.error }).code); error.status = res.statusCode; error.retryable = typeof value.retryable === 'boolean' ? value.retryable : status(error).retryable;
+                        finish(error); return;
+                    }
+                    finish(null, value);
+                });
+            });
+            if (owner) owner.requests.push(req);
+            deadline = nodeTimers.setTimeout(function () { finish(failure('timeout')); }, Math.max(1, Math.min(TIMEOUT_MS, timeoutMs || TIMEOUT_MS)));
+            req.on('close', function () {
+                if (!done && (!owner || !owner.closed)) { finish(failure('network_unavailable')); return; }
+                nodeTimers.clearTimeout(deadline);
+                if (owner) { const i = owner.requests.indexOf(req); if (i >= 0) owner.requests.splice(i, 1); }
+            });
+            req.on('error', function () { finish(failure('network_unavailable')); });
+            if (payload) req.write(payload);
+            req.end();
+        } catch (_) { finish(failure('service_unavailable')); }
     });
 }
 
@@ -138,6 +187,7 @@ Client.prototype.video = function (id) {
         return value;
     }.bind(this));
 };
+Client.prototype.providerHealth = function () { return this.request('GET', this.query('/api/provider-health'), undefined, 20000); };
 Client.prototype.captions = function (id) {
     return this.request( 'GET', this.query('/api/captions/' + id));
 };
@@ -158,4 +208,4 @@ Client.prototype.thumb = function (item, size) {
     return this.settings.base + item.thumb + '?q=' + encodeURIComponent(size || 'mqdefault') + '&token=' + encodeURIComponent(this.settings.token);
 };
 
-module.exports = { Client: Client, readConfig: readConfig, isLocal: isLocal, CONFIG: CONFIG };
+module.exports = { Client: Client, readConfig: readConfig, isLocal: isLocal, CONFIG: CONFIG, status: status };

@@ -8,7 +8,9 @@ function Cache(directory, maxBytes, maxEntries, maxFile) {
   this.maxBytes = maxBytes || 16 * 1024 * 1024;
   this.maxEntries = maxEntries || 128;
   this.maxFile = maxFile || 512 * 1024;
-  this.trim(0, 0);
+  try {
+    this.trim(0, 0);
+  } catch (e) {/* optional cache may be missing, full or read-only */}
 }
 Cache.prototype.file = function (name) {
   if (!/^[A-Za-z0-9_-]+\.jpg$/.test(name)) throw Error('thumbnail_name_invalid');

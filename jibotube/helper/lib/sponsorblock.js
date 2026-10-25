@@ -24,7 +24,7 @@ function _segments() {
     let data = [];
     try {
       data = yield fetchJson(url, {
-        timeoutMs: 12000
+        timeoutMs: 3000
       });
     } catch (error) {
       if (error.status === 404) data = [];else return [];

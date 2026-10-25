@@ -10,12 +10,14 @@ function audioRank(format) {
 }
 function select(formats, config) {
     let video = null, audio = null;
+    const videos = [];
     (formats || []).forEach(format => {
         if (!format.url) return;
         const mime = String(format.mimeType || '');
         if (/video\/mp4/.test(mime) && /avc1/.test(mime)) {
             const height = Number(format.height) || 0, fps = Number(format.fps) || 30;
-            if (height > config.maxHeight || fps > (config.maxFps || 30)) return;
+            if (height <= 0 || height > config.maxHeight || fps > (config.maxFps || 30)) return;
+            videos.push(format);
             if (!video || height > Number(video.height) || (height === Number(video.height) && fps < (Number(video.fps) || 30))) video = format;
         } else if (/audio\/mp4/.test(mime) && /mp4a/.test(mime)) {
             const rank = audioRank(format), previous = audio ? audioRank(audio) : -1;
@@ -32,6 +34,7 @@ function select(formats, config) {
         else { result.height = Number(format.height) || 0; result.fps = Number(format.fps) || 30; }
         return result;
     }
-    return { video: item(video, false), audio: item(audio, true) };
+    videos.sort((a, b) => Number(b.height) - Number(a.height) || (Number(a.fps) || 30) - (Number(b.fps) || 30));
+    return { video: item(video, false), audio: item(audio, true), videoCandidates: videos.slice(0, 3).map(format => item(format, false)) };
 }
 module.exports = { select: select, audioRank: audioRank };

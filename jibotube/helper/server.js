@@ -13,7 +13,8 @@ const stream = require('./lib/stream');
 const {
   fetchBuffer,
   cleanText,
-  videoId
+  videoId,
+  safeCode
 } = require('./lib/util');
 const VERSION = '2.0.0';
 const THUMB_NAMES = new Set(['hqdefault', 'mqdefault', 'maxresdefault', 'hq720', 'sddefault']);
@@ -51,10 +52,12 @@ function headers(extra) {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type, X-JiboTube-Token, Range',
     'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
-    'Cache-Control': 'no-store'
+    'Cache-Control': 'no-store',
+    'Connection': 'close'
   }, extra || {});
 }
 function sendJson(response, status, value) {
+  if (response.finished || response.destroyed) return;
   const body = JSON.stringify(value);
   response.writeHead(status, headers({
     'Content-Type': 'application/json; charset=utf-8',
@@ -65,32 +68,58 @@ function sendJson(response, status, value) {
 function sendError(response, status, code, detail) {
   sendJson(response, status, {
     error: code,
-    detail: detail || ''
+    retryable: /^(timeout|network_unavailable|provider_busy|provider_unavailable|service_unavailable|unauthorized|playback_failed)$/.test(code),
+    detail: ''
   });
 }
 function bodyOf(request) {
   return new Promise(function (resolve, reject) {
-    let size = 0;
+    let size = 0,
+      done = false;
     const chunks = [];
-    request.on('data', function (chunk) {
+    const timer = setTimeout(function () {
+      finish(new Error('timeout'));
+      request.pause();
+    }, 5000);
+    function finish(error, value) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      request.removeListener('data', data);
+      request.removeListener('end', end);
+      request.removeListener('aborted', failed);
+      if (error) reject(error);else resolve(value);
+    }
+    function data(chunk) {
       size += chunk.length;
       if (size > 128 * 1024) {
-        reject(new Error('body_too_large'));
-        request.destroy();
+        finish(new Error('body_too_large'));
+        request.pause();
         return;
       }
       chunks.push(chunk);
-    });
-    request.on('end', function () {
-      if (!chunks.length) return resolve({});
+    }
+    function end() {
+      let value;
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-      } catch (error) {
-        reject(new Error('bad_json'));
+        value = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+      } catch (_) {
+        finish(new Error('bad_json'));
+        return;
       }
-    });
-    request.on('error', reject);
+      finish(null, value);
+    }
+    function failed() {
+      finish(new Error('closed'));
+    }
+    request.on('data', data);
+    request.on('end', end);
+    request.on('error', failed);
+    request.on('aborted', failed);
   });
+}
+function isJpeg(bytes) {
+  return Buffer.isBuffer(bytes) && bytes.length >= 512 && bytes.length <= 512 * 1024 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 && bytes[bytes.length - 2] === 255 && bytes[bytes.length - 1] === 217;
 }
 function thumbnail(_x, _x2) {
   return _thumbnail.apply(this, arguments);
@@ -99,18 +128,24 @@ function _thumbnail() {
   _thumbnail = _asyncToGenerator(function* (id, name) {
     const cacheName = id + '-' + name + '.jpg';
     const cached = thumbCache.get(cacheName);
-    if (cached) return {
-      file: cached,
-      type: 'image/jpeg'
-    };
+    if (cached) {
+      try {
+        if (isJpeg(fs.readFileSync(cached))) return {
+          file: cached,
+          type: 'image/jpeg'
+        };
+        fs.unlinkSync(cached);
+      } catch (_) {}
+    }
     const order = name === 'maxresdefault' ? ['maxresdefault', 'hq720', 'hqdefault'] : [name, 'hq720', 'hqdefault'];
     let lastError = null;
     for (let i = 0; i < order.length; i++) {
       try {
         const result = yield fetchBuffer('https://i.ytimg.com/vi/' + id + '/' + order[i] + '.jpg', {
-          timeoutMs: 12000
+          timeoutMs: 2500,
+          maxBytes: 512 * 1024
         });
-        if (!result.buffer || result.buffer.length < 512) throw new Error('thumb_empty');
+        if (!isJpeg(result.buffer)) throw new Error('thumb_invalid');
         const file = thumbCache.put(cacheName, result.buffer);
         return {
           file: file,
@@ -182,6 +217,13 @@ function _handle() {
       });
     }
     if (!tokenOk(request, query)) return sendError(response, 401, 'unauthorized');
+    if (pathname === '/api/provider-health' && request.method === 'GET') {
+      try {
+        return sendJson(response, 200, yield require('./lib/innertube').providerHealth());
+      } catch (error) {
+        return sendError(response, 502, safeCode(error));
+      }
+    }
     if (request.method === 'GET' && pathname === '/api/home') {
       const history = [];
       const likes = [];
@@ -238,7 +280,7 @@ function _handle() {
       try {
         return sendJson(response, 200, yield home.details(videoMatch[1]));
       } catch (error) {
-        return sendError(response, 502, 'video_unavailable', String(error.message || error));
+        return sendError(response, 502, safeCode(error));
       }
     }
     const streamMatch = /^\/api\/stream\/([A-Za-z0-9_-]{11})$/.exec(pathname);
@@ -246,7 +288,7 @@ function _handle() {
       try {
         return sendJson(response, 200, yield stream.info(streamMatch[1], Number(query.t || 0), query.snap));
       } catch (error) {
-        return sendError(response, 502, 'stream_unavailable', String(error.message || error));
+        return sendError(response, 502, safeCode(error));
       }
     }
     const proxyMatch = /^\/stream\/([A-Za-z0-9_-]{11})\/(video|audio)$/.exec(pathname);
@@ -254,7 +296,7 @@ function _handle() {
       try {
         return yield stream.proxy(proxyMatch[1], proxyMatch[2], Number(query.frag || 0), Number(query.t || 0), request, response);
       } catch (error) {
-        if (!response.headersSent) return sendError(response, 502, 'stream_unavailable', String(error.message || error));
+        if (!response.headersSent) return sendError(response, 502, safeCode(error));
         try {
           response.destroy();
         } catch (_) {}
@@ -301,6 +343,8 @@ function _handle() {
 }
 let server = null;
 let sockets = [];
+let activeRequests = 0;
+const MAX_REQUESTS = 12;
 function start() {
   if (server) return server;
   sockets = [];
@@ -308,26 +352,55 @@ function start() {
     fs.writeFileSync(PID_FILE, String(process.pid) + '\n');
   } catch (_) {}
   server = http.createServer(function (request, response) {
+    clearTimeout(request.socket.jibotubeHeaderTimer);
+    if (activeRequests >= MAX_REQUESTS) {
+      sendError(response, 503, 'provider_busy');
+      return;
+    }
+    activeRequests++;
+    let released = false;
+    const deadline = /^\/stream\//.test(request.url) ? null : setTimeout(function () {
+      if (!response.headersSent) sendError(response, 504, 'timeout');else response.destroy();
+    }, 40000);
+    function release() {
+      if (released) return;
+      released = true;
+      activeRequests--;
+      clearTimeout(deadline);
+      response.removeListener('finish', release);
+      response.removeListener('close', release);
+    }
+    response.on('finish', release);
+    response.on('close', release);
     handle(request, response).catch(function (error) {
       try {
-        sendError(response, 500, 'internal', String(error && error.message || error));
+        if (!response.headersSent) sendError(response, 502, safeCode(error));else response.destroy();
       } catch (_) {}
     });
   });
   server.on('connection', function (socket) {
+    if (sockets.length >= 24) {
+      socket.destroy();
+      return;
+    }
     sockets.push(socket);
+    socket.jibotubeHeaderTimer = setTimeout(function () {
+      socket.destroy();
+    }, 10000);
+    socket.setTimeout(30000, function () {
+      socket.destroy();
+    });
     socket.on('close', function () {
+      clearTimeout(socket.jibotubeHeaderTimer);
       const index = sockets.indexOf(socket);
       if (index >= 0) sockets.splice(index, 1);
     });
   });
   server.on('error', function (error) {
-    process.stdout.write('jibotube service error ' + String(error && error.message || error) + '\n');
+    process.stdout.write('jibotube service error ' + (/^[A-Z_]+$/.test(error && error.code || '') ? error.code : 'failed') + '\n');
   });
   server.listen(config.port, config.host, function () {
-    process.stdout.write('jibotube service ' + VERSION + ' listening on http://' + config.host + ':' + config.port + '\n');
-    process.stdout.write('cache ' + config.cacheDir + '\n');
-    process.stdout.write('token ' + (process.env.JIBOTUBE_TOKEN ? 'from env' : 'from file') + '\n');
+    process.stdout.write('jibotube service ' + VERSION + ' listening\n');
   });
   return server;
 }

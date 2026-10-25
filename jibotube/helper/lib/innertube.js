@@ -45,6 +45,7 @@ const CACHE_TTL = 8 * 60 * 1000;
 const cache = new Map();
 let active = 0;
 const waiting = [];
+const inFlight = new Map();
 function schedule(work) {
   return new Promise(function (resolve, reject) {
     const start = function () {
@@ -59,7 +60,21 @@ function schedule(work) {
         reject(error);
       });
     };
-    if (active < 4) start();else waiting.push(start);
+    if (active < 4) start();else if (waiting.length < 20) {
+      let timer = null;
+      const queued = function () {
+        clearTimeout(timer);
+        start();
+      };
+      timer = setTimeout(function () {
+        const i = waiting.indexOf(queued);
+        if (i >= 0) {
+          waiting.splice(i, 1);
+          reject(require('./util').failure('timeout'));
+        }
+      }, 10000);
+      waiting.push(queued);
+    } else reject(require('./util').failure('provider_busy'));
   });
 }
 function pump() {
@@ -69,76 +84,33 @@ function cached(key, ttl, work) {
   const now = Date.now(),
     hit = cache.get(key);
   if (hit && now - hit.at < ttl) return Promise.resolve(hit.value);
-  return Promise.resolve(work()).then(function (value) {
+  if (inFlight.has(key)) return inFlight.get(key);
+  if (inFlight.size >= 24) return Promise.reject(require('./util').failure('provider_busy'));
+  const pending = Promise.resolve().then(work).then(function (value) {
     cache.set(key, {
       at: Date.now(),
       value: value
     });
-    if (cache.size > 500) cache.delete(cache.keys().next().value);
+    if (cache.size > 64) cache.delete(cache.keys().next().value);
+    inFlight.delete(key);
     return value;
+  }, function (error) {
+    inFlight.delete(key);
+    throw error;
   });
+  inFlight.set(key, pending);
+  return pending;
 }
 function thumbPath(id) {
   return '/thumb/' + id + '.jpg';
 }
 function requestBuffer(target, options) {
-  options = options || {};
-  return new Promise(function (resolve, reject) {
-    let parsed;
-    try {
-      parsed = url.parse(target);
-    } catch (error) {
-      reject(error);
-      return;
-    }
-    const lib = parsed.protocol === 'https:' ? https : http;
-    const headers = Object.assign({
-      'User-Agent': USER_AGENT,
-      'Accept-Encoding': 'gzip'
-    }, options.headers || {});
-    const req = lib.request({
-      protocol: parsed.protocol,
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.path,
-      method: options.method || 'GET',
-      headers: headers
-    }, function (response) {
-      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        response.resume();
-        resolve(requestBuffer(url.resolve(target, response.headers.location), options));
-        return;
-      }
-      const chunks = [];
-      let stream = response;
-      if (response.headers['content-encoding'] === 'gzip') stream = response.pipe(zlib.createGunzip());else if (response.headers['content-encoding'] === 'deflate') stream = response.pipe(zlib.createInflate());
-      stream.on('data', function (chunk) {
-        chunks.push(chunk);
-      });
-      stream.on('error', reject);
-      stream.on('end', function () {
-        const buffer = Buffer.concat(chunks);
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          const error = new Error('http_' + response.statusCode);
-          error.status = response.statusCode;
-          error.body = buffer.toString('utf8').slice(0, 300);
-          reject(error);
-          return;
-        }
-        resolve({
-          buffer: buffer,
-          headers: response.headers,
-          status: response.statusCode
-        });
-      });
-    });
-    req.setTimeout(options.timeoutMs || config.requestTimeoutMs, function () {
-      req.destroy(new Error('timeout'));
-    });
-    req.on('error', reject);
-    if (options.body) req.write(options.body);
-    req.end();
-  });
+  return require('./util').requestBuffer(target, Object.assign({
+    headers: {
+      'User-Agent': USER_AGENT
+    },
+    retries: 1
+  }, options || {}));
 }
 function post(_x, _x2, _x3) {
   return _post.apply(this, arguments);
@@ -157,7 +129,14 @@ function _post() {
       body: body,
       timeoutMs: 25000
     });
-    return JSON.parse(response.buffer.toString('utf8'));
+    let value;
+    try {
+      value = JSON.parse(response.buffer.toString('utf8'));
+    } catch (_) {
+      throw require('./util').failure('provider_changed');
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw require('./util').failure('provider_changed');
+    return value;
   });
   return _post.apply(this, arguments);
 }
@@ -323,6 +302,7 @@ function _search() {
           },
           query: query
         });
+        if (!data.contents || typeof data.contents !== 'object') throw require('./util').failure('provider_changed');
         const items = [];
         collect(data.contents || data, items);
         const seen = new Set();
@@ -336,7 +316,19 @@ function _search() {
   });
   return _search.apply(this, arguments);
 }
-function pickFormats(formats) { return require('./format-selection').select(formats, config); }
+function indexed(format) {
+  return ['initRange', 'indexRange'].every(function (key) {
+    const r = format[key],
+      start = r && Number(r.start),
+      end = r && Number(r.end);
+    return isFinite(start) && isFinite(end) && start >= 0 && end >= start && end - start < 512 * 1024;
+  });
+}
+function pickFormats(formats) {
+  return require('./format-selection').select((Array.isArray(formats) ? formats : []).filter(function (format) {
+    return format && /^https?:\/\//.test(format.url || '') && indexed(format);
+  }), config);
+}
 
 function video(_x0) {
   return _video.apply(this, arguments);
@@ -349,20 +341,31 @@ function _video() {
       return schedule(/*#__PURE__*/_asyncToGenerator(function* () {
         let data = yield player(id, false);
         if ((data.playabilityStatus || {}).status === 'LOGIN_REQUIRED') data = yield player(id, true);
-        const status = data.playabilityStatus || {};
+        const fail = require('./util').failure;
+        const status = data && data.playabilityStatus;
+        if (!status || typeof status.status !== 'string') throw fail('provider_changed');
         if (status.status !== 'OK') {
-          const error = new Error(cleanText(status.reason || status.status || 'unavailable', 200));
-          error.code = !/not a bot/i.test(error.message) && /age|sign in/i.test(error.message) ? 'age_restricted' : 'unavailable';
-          throw error;
+          const reason = String(status.reason || '');
+          let code = 'unavailable';
+          if (/live|premiere|upcoming/i.test(reason) || status.status === 'LIVE_STREAM_OFFLINE') code = 'unsupported_live';else if (/country|region/i.test(reason)) code = 'region';else if (/member|join this channel|subscription/i.test(reason)) code = 'members_only';else if (/not a bot|unusual traffic/i.test(reason)) code = 'provider_unavailable';else if (/age|sign in/i.test(reason)) code = 'age_restricted';
+          throw fail(code);
         }
         const details = data.videoDetails || {};
+        const duration = Number(details.lengthSeconds);
+        if (details.isLiveContent || details.isUpcoming) throw fail('unsupported_live');
+        if (!isFinite(duration) || duration <= 0 || !details.title) throw fail('provider_changed');
+        if (duration > 6 * 60 * 60) throw fail('video_too_long');
         const micro = data.microformat && data.microformat.playerMicroformatRenderer || {};
-        const formats = pickFormats(data.streamingData && data.streamingData.adaptiveFormats);
+        const rawFormats = data.streamingData && data.streamingData.adaptiveFormats;
+        if (!Array.isArray(rawFormats)) throw fail('provider_changed');
+        const formats = pickFormats(rawFormats);
         if (!formats.video) {
-          const error = new Error('No H.264 video format');
-          error.code = 'unavailable';
-          throw error;
+          if (rawFormats.some(function (f) {
+            return f && (f.signatureCipher || f.cipher);
+          })) throw fail('provider_changed');
+          throw fail('unsupported_format');
         }
+        if (!formats.audio) throw fail('audio_missing');
         const tracks = data.captions && data.captions.playerCaptionsTracklistRenderer && data.captions.playerCaptionsTracklistRenderer.captionTracks || [];
         let track = null;
         tracks.forEach(function (item) {
@@ -455,11 +458,37 @@ function _captions() {
   });
   return _captions.apply(this, arguments);
 }
+let healthPending = null;
+function providerHealth() {
+  if (healthPending) return healthPending;
+  healthPending = visitorData(false).then(function () {
+    return post('search', {
+      context: {
+        client: CLIENT
+      },
+      query: 'video'
+    });
+  }).then(function (data) {
+    if (!data.contents || typeof data.contents !== 'object') throw require('./util').failure('provider_changed');
+    return {
+      ok: true,
+      status: 'ready'
+    };
+  }).then(function (value) {
+    healthPending = null;
+    return value;
+  }, function (error) {
+    healthPending = null;
+    throw error;
+  });
+  return healthPending;
+}
 module.exports = {
   search: search,
   video: video,
   forget: forget,
   captions: captions,
+  providerHealth: providerHealth,
   PLAYER_USER_AGENT: PLAYER_USER_AGENT,
   thumbPath: thumbPath,
   requestBuffer: requestBuffer,

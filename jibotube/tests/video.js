@@ -110,5 +110,44 @@ module.exports = function () {
                 return joined.stop().then(() => { assert(requests.every(req => req.aborted)); assert.strictEqual(doc.body.children.length, 0); });
             });
         });
-    }).then(() => video.shutdown(), error => video.shutdown().then(() => { throw error; }));
+    }).then(() => watchdogs(options, doc)).then(() => video.shutdown(), error => video.shutdown().then(() => { throw error; }));
 };
+
+function watchdogs(options, doc) {
+    let clock = 0, error;
+    const start = video.open(Object.assign({}, options, { now: () => clock }));
+    start.on('error', event => { error = event; });
+    return new Promise(resolve => setTimeout(resolve, 5)).then(() => {
+        clock = 25001; start.sync();
+        assert.strictEqual(error.reason, 'media_timeout'); assert.strictEqual(start.state, 'stopped');
+        assert.strictEqual(doc.body.children.length, 0);
+        clock = 0; error = null;
+        const stalled = video.open(Object.assign({}, options, { now: () => clock }));
+        stalled.on('error', event => { error = event; });
+        return new Promise(resolve => setTimeout(resolve, 5)).then(() => {
+            stalled.elements.forEach(element => { element.readyState = 3; element.ranges = [[0, 60]]; });
+            stalled.media.webkitDecodedFrameCount = 1; stalled.media.fire('progress');
+            assert.strictEqual(stalled.state, 'playing');
+            clock = 1000; stalled.media.currentTime = 1; stalled.sync();
+            stalled.pause(); clock = 50000; stalled.sync(); assert(!error, 'pause never trips the stall watchdog');
+            stalled.show(); clock += 14000; stalled.sync(); assert(!error, 'resume gets a fresh stall deadline');
+            stalled.media.currentTime = 2; stalled.media.webkitDecodedFrameCount = 2; stalled.sync();
+            clock += 14000; stalled.sync(); assert(!error, 'decoded progress extends the deadline');
+            // An advancing media clock with a frozen decoder is still a stall.
+            stalled.media.currentTime = 30; clock += 1001; stalled.sync();
+            assert.strictEqual(error.reason, 'playback_stalled'); assert.strictEqual(stalled.state, 'stopped');
+            assert.strictEqual(doc.body.children.length, 0);
+            clock = 0; error = null;
+            const rebuffer = video.open(Object.assign({}, options, { now: () => clock }));
+            rebuffer.on('error', event => { error = event; });
+            return new Promise(resolve => setTimeout(resolve, 5)).then(() => {
+                rebuffer.elements.forEach(element => { element.readyState = 3; element.ranges = [[0, 10]]; });
+                rebuffer.media.fire('progress'); rebuffer.media.fire('waiting');
+                clock = 15001; rebuffer.sync();
+                assert.strictEqual(error.reason, 'playback_stalled', 'rebuffering has a bounded wait');
+                assert.strictEqual(doc.body.children.length, 0);
+                console.log('PASS startup deadline, paused watchdog, resume grace, frozen decoder and rebuffer deadline');
+            });
+        });
+    });
+}

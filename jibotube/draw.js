@@ -169,6 +169,12 @@ const ICONS = {
         disc(g, x + s * 0.31, y + s * 0.36, s * 0.22); disc(g, x + s * 0.69, y + s * 0.36, s * 0.22);
         polygon(g, [x + s * 0.1, y + s * 0.44, x + s * 0.9, y + s * 0.44, x + s * 0.5, y + s * 0.9]);
     },
+    // A clock face: recent searches.
+    history(g, x, y, s) {
+        ring(g, x + s * 0.5, y + s * 0.5, s * 0.44, Math.max(2, s * 0.1));
+        g.drawRect(x + s * 0.45, y + s * 0.22, s * 0.1, s * 0.32);
+        g.drawRect(x + s * 0.45, y + s * 0.45, s * 0.28, s * 0.1);
+    },
 };
 function icon(g, name, x, y, s, color) {
     const draw = ICONS[name];

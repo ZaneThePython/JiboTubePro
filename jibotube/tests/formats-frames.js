@@ -13,7 +13,9 @@ module.exports = function () {
     assert.strictEqual(select([foreign, english, sound('another', { id: 'fr.4' }, 48000)], config).audio.url, english.url);
     assert.strictEqual(select([english, sound('default-original', { id: 'ja.4', audioIsDefault: true })], config).audio.audioTrack.audioIsDefault, true);
     const formats = [picture(720, 60), picture(480, 60), picture(360, 30), picture(480, 30), picture(1080, 30)];
-    const chosen = select(formats, config).video; assert.strictEqual(chosen.height, 480); assert.strictEqual(chosen.fps, 30);
+    const selected = select(formats, config);
+    assert(selected.videoCandidates.every(format => format.height <= 480 && format.fps <= 30));
+    const chosen = selected.video; assert.strictEqual(chosen.height, 480); assert.strictEqual(chosen.fps, 30);
     assert.strictEqual(require('../helper/lib/config').maxHeight, 480);
     let pending, cancelled = false, uploads = 0;
     const scheduler = { requestAnimationFrame: fn => { pending = fn; return 1; }, cancelAnimationFrame: () => { cancelled = true; } };

@@ -1,8 +1,36 @@
 'use strict';
 
-// Canvas-drawn player controls rendered as PIXI sprites above the video texture.
+// Canvas player controls rendered above Pro's video texture in the same PIXI scene.
+// PLAYER supplies both drawing rectangles and touch targets.
 const W = 1280, H = 720;
 const FONT = '"Proxima Nova Soft", sans-serif';
+const PLAYER = {
+    // Back sits exactly where the app's Back sits on every other screen.
+    back: { x: 248, y: 16, w: 156, h: 72 },
+    top: { x: 0, y: 0, w: W, h: 112 },
+    // While paused: a big resume button in the middle of the picture.
+    pausedCard: { x: 520, y: 136, w: 240, h: 208 },
+    startCard: { x: 380, y: 268, w: 520, h: 128 },
+    // Bottom block: times + scrubber, then one row of buttons.
+    bar: { x: 0, y: 470, w: W, h: 250 },
+    scrub: { x: 168, y: 520, w: 1040, h: 80 },
+    seekSegments: 16,
+    back10: { x: 168, y: 612, w: 96, h: 88 },
+    play: { x: 276, y: 612, w: 112, h: 88 },
+    fwd10: { x: 400, y: 612, w: 96, h: 88 },
+    captions: { x: 528, y: 612, w: 112, h: 88 },
+    volDown: { x: 672, y: 612, w: 88, h: 88 },
+    volUp: { x: 848, y: 612, w: 88, h: 88 },
+    settings: { x: 968, y: 612, w: 96, h: 88 },
+    next: { x: 1076, y: 612, w: 132, h: 88 },
+    panel: { x: 340, y: 132, w: 600, h: 452 },
+    settingsRows: [
+        { label: 'Captions', off: { x: 640, y: 212, w: 120, h: 64 }, on: { x: 776, y: 212, w: 120, h: 64 } },
+        { label: 'Repeat', off: { x: 640, y: 296, w: 120, h: 64 }, on: { x: 776, y: 296, w: 120, h: 64 } },
+        { label: 'Autoplay', off: { x: 640, y: 380, w: 120, h: 64 }, on: { x: 776, y: 380, w: 120, h: 64 } }
+    ],
+    done: { x: 530, y: 488, w: 220, h: 72 }
+};
 
 function canvas(width, height) {
     const element = document.createElement('canvas');
@@ -21,6 +49,7 @@ function triangle(ctx, x, y, size, direction) {
     else { ctx.moveTo(x, y); ctx.lineTo(x + size, y + size / 2); ctx.lineTo(x, y + size); }
     ctx.closePath(); ctx.fill();
 }
+function disc(ctx, x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
 function clock(seconds) {
     seconds = Math.max(0, Math.floor(Number(seconds) || 0));
     const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60;
@@ -35,24 +64,56 @@ function text(ctx, value, x, y, size, color, align, weight) {
 }
 function ellipsis(ctx, value, width, size, weight) {
     ctx.font = (weight || 'normal') + ' ' + size + 'px ' + FONT;
-    let result = String(value || '');
+    let result = String(value || '').replace(/[\uD800-\uDFFF\uFE0F\u200D\u2600-\u27BF]/g, '').replace(/\s+/g, ' ').trim();
     if (ctx.measureText(result).width <= width) return result;
-    while (result.length > 1 && ctx.measureText(result + '…').width > width) result = result.slice(0, -1);
-    return result.replace(/\s+$/, '') + '…';
+    const chars = Array.from(result);
+    while (chars.length > 1 && ctx.measureText(chars.join('') + '…').width > width) chars.pop();
+    return chars.join('').replace(/\s+$/, '') + '…';
+}
+// A control's rectangle relative to a layer's origin.
+function at(rect, origin) { return { x: rect.x - origin.x, y: rect.y - origin.y, w: rect.w, h: rect.h }; }
+function button(ctx, r, fill, radius) { rounded(ctx, r.x, r.y, r.w, r.h, radius === undefined ? 16 : radius); ctx.fillStyle = fill; ctx.fill(); }
+function speaker(ctx, x, y, s, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y + s * 0.34, s * 0.26, s * 0.32);
+    ctx.beginPath(); ctx.moveTo(x + s * 0.22, y + s * 0.34); ctx.lineTo(x + s * 0.58, y + s * 0.08); ctx.lineTo(x + s * 0.58, y + s * 0.92); ctx.lineTo(x + s * 0.22, y + s * 0.66); ctx.closePath(); ctx.fill();
+}
+function skipGlyph(ctx, cx, cy, forward, color) {
+    // A circular arrow with "10" inside: an abstract skip glyph.
+    ctx.strokeStyle = color; ctx.lineWidth = 6;
+    ctx.beginPath();
+    if (forward) ctx.arc(cx, cy, 34, -Math.PI * 0.35, Math.PI * 1.35, false); else ctx.arc(cx, cy, 34, Math.PI * 1.35, -Math.PI * 0.35, true);
+    ctx.stroke();
+    ctx.fillStyle = color;
+    const tx = forward ? cx + 20 : cx - 20, dir = forward ? 1 : -1;
+    ctx.beginPath(); ctx.moveTo(tx - 2 * dir, cy - 46); ctx.lineTo(tx + 16 * dir, cy - 30); ctx.lineTo(tx - 6 * dir, cy - 22); ctx.closePath(); ctx.fill();
+    text(ctx, '10', cx, cy + 2, 28, color, 'center', 'bold');
+}
+
+// Words while a video is getting ready (STATUS-CONTRACT active states).
+// The controller reports `statusCode` (reconnecting) or a short statusText.
+function startingWords(player) {
+    const code = player && player.statusCode, text = player && player.statusText || '';
+    if (code === 'reconnecting' || /^Reconnecting/.test(text)) return { title: 'Reconnecting…', body: 'Connection lost. Trying once more.' };
+    if (code === 'format_fallback') return { title: 'Trying a lower quality…', body: 'This can take a few seconds.' };
+    if (code === 'starting_service' || /local service/.test(text)) return { title: 'Starting JiboTube…', body: 'This can take a few seconds.' };
+    if (/^Seeking/.test(text)) return { title: 'Jumping to ' + clock(player.position) + '…', body: 'One moment.' };
+    if (/^Resuming/.test(text)) return { title: 'Resuming…', body: 'One moment.' };
+    if (code === 'buffering' || /^Buffering/.test(text)) return { title: 'Getting the video ready…', body: 'This can take a few seconds.' };
+    return { title: 'Starting video…', body: 'This can take a few seconds.' };
 }
 
 class Overlay {
     // stage: JiboTube's PIXI container; repaint: draws BE now (the face
     // renderer only ticks a few times a second during playback).
     constructor(stage, repaint) {
-        this.top = canvas(W, 104);
-        this.bar = canvas(W, 180);
-        this.time = canvas(900, 76);
-        this.center = canvas(720, 420);
+        this.top = canvas(W, PLAYER.top.h);
+        this.bar = canvas(W, PLAYER.bar.h);
+        this.time = canvas(1080, 140);
+        this.center = canvas(PLAYER.startCard.w, PLAYER.pausedCard.h);
         this.toast = canvas(860, 64);
-        this.vol = canvas(250, 64);
-        this.caption = canvas(1000, 90);
-        this.settings = canvas(680, 420);
+        this.caption = canvas(1000, 100);
+        this.settings = canvas(PLAYER.panel.w, PLAYER.panel.h);
         this.keys = {};
         this.lastTime = 0;
         this.active = false;
@@ -96,179 +157,166 @@ class Overlay {
             try { if (container.parent) container.parent.removeChild(container); container.destroy({ children: true }); } catch (_) {}
         }
     }
+    // Back and the title: shown whenever controls are, and while starting.
     drawTop(session, player) {
-        const ctx = this.top.getContext('2d');
-        ctx.globalAlpha = player.controlsAlpha == null ? 1 : player.controlsAlpha;
-        ctx.clearRect(0, 0, W, 104);
-        const gradient = ctx.createLinearGradient(0, 0, 0, 104);
-        gradient.addColorStop(0, 'rgba(0,0,0,0.82)'); gradient.addColorStop(1, 'rgba(0,0,0,0)');
-        ctx.fillStyle = gradient; ctx.fillRect(0, 0, W, 104);
-        ctx.fillStyle = 'rgba(255,255,255,0.95)';
-        ctx.beginPath(); ctx.moveTo(46, 34); ctx.lineTo(30, 50); ctx.lineTo(46, 66); ctx.lineTo(46, 58);
-        ctx.lineTo(62, 58); ctx.lineTo(62, 42); ctx.lineTo(46, 42); ctx.closePath(); ctx.fill();
-        text(ctx, ellipsis(ctx, player.title, 820, 30, 'bold'), 84, 38, 30, 'rgba(255,255,255,0.97)', 'left', 'bold');
-        text(ctx, ellipsis(ctx, player.channel, 820, 20), 84, 72, 20, 'rgba(200,225,232,0.86)', 'left');
+        const ctx = this.top.getContext('2d'), h = PLAYER.top.h, b = PLAYER.back;
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, W, h);
+        ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, W, h);
+        button(ctx, b, '#17363F');
+        ctx.fillStyle = '#FFFFFF';
+        ctx.beginPath(); ctx.moveTo(b.x + 40, b.y + 20); ctx.lineTo(b.x + 24, b.y + 36); ctx.lineTo(b.x + 40, b.y + 52); ctx.lineTo(b.x + 46, b.y + 46);
+        ctx.lineTo(b.x + 36, b.y + 36); ctx.lineTo(b.x + 46, b.y + 26); ctx.closePath(); ctx.fill();
+        text(ctx, 'Back', b.x + 98, b.y + b.h / 2, 24, '#FFFFFF', 'center', 'bold');
+        const x = b.x + b.w + 24, width = 1200 - x;
+        text(ctx, ellipsis(ctx, player.title, width, 28, 'bold'), x, 38, 28, '#FFFFFF', 'left', 'bold');
+        // SponsorBlock is on for this video: a short pill beside the channel.
+        let channelWidth = width;
         if (player.sponsorCount > 0) {
-            rounded(ctx, 1004, 26, 232, 40, 20); ctx.fillStyle = 'rgba(12,42,48,0.9)'; ctx.fill();
-            ctx.strokeStyle = 'rgba(255,184,77,0.85)'; ctx.lineWidth = 2; ctx.stroke();
-            text(ctx, ellipsis(ctx, 'SponsorBlock · ' + player.sponsorCount + ' skipped', 208, 19, 'bold'), 1120, 47, 19, 'rgba(255,211,140,0.98)', 'center', 'bold');
+            const label = 'SponsorBlock on';
+            ctx.font = 'bold 20px ' + FONT;
+            const pill = Math.ceil(ctx.measureText(label).width) + 32;
+            rounded(ctx, 1200 - pill, 58, pill, 34, 17); ctx.fillStyle = 'rgba(12,42,48,0.95)'; ctx.fill();
+            ctx.strokeStyle = 'rgba(255,194,102,0.9)'; ctx.lineWidth = 2; ctx.stroke();
+            text(ctx, label, 1200 - pill / 2, 76, 20, '#FFD28C', 'center', 'bold');
+            channelWidth = width - pill - 20;
         }
-        this.layer(session, 'jt-top', this.top, W, 104, 0, 0);
+        text(ctx, ellipsis(ctx, player.channel, channelWidth, 22), x, 74, 22, 'rgba(206,228,234,0.95)', 'left');
+        this.layer(session, 'jt-top', this.top, W, h, 0, 0);
     }
-    drawBar(session, player) {
-        const ctx = this.bar.getContext('2d');
-        ctx.globalAlpha = player.controlsAlpha == null ? 1 : player.controlsAlpha;
-        ctx.clearRect(0, 0, W, 180);
-        const gradient = ctx.createLinearGradient(0, 0, 0, 180);
-        gradient.addColorStop(0, 'rgba(0,0,0,0)'); gradient.addColorStop(0.45, 'rgba(0,0,0,0.55)'); gradient.addColorStop(1, 'rgba(0,0,0,0.9)');
-        ctx.fillStyle = gradient; ctx.fillRect(0, 0, W, 180);
-        ctx.fillStyle = 'rgba(255,255,255,0.92)';
-        // -10
-        triangle(ctx, 60, 92, 18, 'left'); triangle(ctx, 78, 92, 18, 'left');
-        text(ctx, '10', 82, 136, 17, 'rgba(255,255,255,0.9)', 'center', 'bold');
-        // Play / pause disc.
-        ctx.beginPath(); ctx.arc(178, 114, 34, 0, Math.PI * 2); ctx.fillStyle = 'rgba(255,255,255,0.96)'; ctx.fill();
-        ctx.fillStyle = 'rgba(8,24,30,0.95)';
-        if (player.paused || player.ended) triangle(ctx, 168, 100, 28, 'right');
-        else { ctx.fillRect(166, 98, 9, 32); ctx.fillRect(183, 98, 9, 32); }
-        // +10
-        triangle(ctx, 264, 92, 18, 'right'); triangle(ctx, 282, 92, 18, 'right');
-        text(ctx, '10', 278, 136, 17, 'rgba(255,255,255,0.9)', 'center', 'bold');
-        // Next
-        triangle(ctx, 1168, 94, 22, 'right'); ctx.fillRect(1194, 94, 6, 40);
-        text(ctx, 'Next', 1182, 148, 16, 'rgba(200,225,232,0.8)', 'center');
-        // Up next title
-        if (player.nextTitle) text(ctx, 'Up next · ' + ellipsis(ctx, player.nextTitle, 560, 18), 332, 24, 18, 'rgba(200,225,232,0.78)', 'left');
-        // Settings gear (invisible BE button at 900,552).
-        ctx.save(); ctx.translate(936, 44);
-        ctx.strokeStyle = 'rgba(255,255,255,0.86)'; ctx.fillStyle = 'rgba(255,255,255,0.86)'; ctx.lineWidth = 3;
-        for (var gi = 0; gi < 8; gi++) {
-            ctx.save(); ctx.rotate(gi * Math.PI / 4); ctx.fillRect(-4, -23, 8, 9); ctx.restore();
-        }
-        ctx.beginPath(); ctx.arc(0, 0, 15, 0, Math.PI * 2); ctx.stroke();
-        ctx.beginPath(); ctx.arc(0, 0, 5, 0, Math.PI * 2); ctx.stroke();
-        ctx.restore();
-        this.layer(session, 'jt-bar', this.bar, W, 180, 0, 540, { x: 0, y: 556, width: W, height: 164 });
-    }
-    drawTime(session, player) {
-        const ctx = this.time.getContext('2d');
-        ctx.globalAlpha = player.controlsAlpha == null ? 1 : player.controlsAlpha;
-        const width = 806, x = 32, y = 34;
-        ctx.clearRect(0, 0, 900, 76);
-        const fraction = Math.max(0, Math.min(1, (player.position || 0) / Math.max(1, player.duration || 1)));
-        rounded(ctx, x, y, width, 6, 3); ctx.fillStyle = 'rgba(255,255,255,0.26)'; ctx.fill();
-        rounded(ctx, x, y, Math.max(6, width * fraction), 6, 3); ctx.fillStyle = '#FF6B5A'; ctx.fill();
-        ctx.beginPath(); ctx.arc(x + width * fraction, y + 3, 8, 0, Math.PI * 2); ctx.fillStyle = '#FFFFFF'; ctx.fill();
-        text(ctx, clock(player.position), x, 62, 18, 'rgba(235,248,250,0.9)', 'left', 'bold');
-        text(ctx, clock(player.duration), x + width, 62, 18, 'rgba(235,248,250,0.9)', 'right', 'bold');
-        this.layer(session, 'jt-time', this.time, 900, 76, 300, 604, false); // inside the bar's hole
-    }
+    // The middle of the picture stays clear while playing. It shows a card
+    // only while a video is starting, or a big Play button while paused.
     drawCenter(session, player) {
         const ctx = this.center.getContext('2d');
-        ctx.clearRect(0, 0, 720, 420);
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, this.center.width, this.center.height);
         if (player.starting) {
-            ctx.fillStyle = 'rgba(4,16,20,0.55)'; rounded(ctx, 90, 120, 540, 150, 24); ctx.fill();
-            text(ctx, player.statusText || 'Starting…', 360, 186, 28, 'rgba(255,255,255,0.95)', 'center', 'bold');
-            text(ctx, 'Preparing your video on Jibo', 360, 224, 18, 'rgba(180,212,220,0.85)', 'center');
-            this.layer(session, 'jt-center', this.center, 720, 420, 280, 150, { x: 370, y: 270, width: 540, height: 150 });
+            const o = PLAYER.startCard, words = startingWords(player);
+            ctx.fillStyle = '#091B21'; ctx.fillRect(0, 0, o.w, o.h);
+            text(ctx, ellipsis(ctx, words.title, o.w - 48, 28, 'bold'), o.w / 2, 44, 28, '#FFFFFF', 'center', 'bold');
+            text(ctx, ellipsis(ctx, words.body, o.w - 48, 22), o.w / 2, 84, 22, 'rgba(196,220,226,0.95)', 'center');
+            const phase = (Date.now() % 1600) / 1600;
+            rounded(ctx, 60, 106, o.w - 120, 8, 4); ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fill();
+            rounded(ctx, 60 + phase * (o.w - 120) * 0.75, 106, (o.w - 120) / 4, 8, 4); ctx.fillStyle = '#2FD0C0'; ctx.fill();
+            this.layer(session, 'jt-center', this.center, o.w, o.h, o.x, o.y, { x: o.x, y: o.y, width: o.w, height: o.h });
             return;
         }
-        if (player.ended) {
-            ctx.fillStyle = 'rgba(4,16,20,0.82)'; rounded(ctx, 60, 70, 600, 280, 28); ctx.fill();
-            ctx.strokeStyle = 'rgba(47,208,192,0.55)'; ctx.lineWidth = 2; ctx.stroke();
-            text(ctx, 'Up next', 360, 118, 20, 'rgba(47,208,192,0.95)', 'center', 'bold');
-            text(ctx, ellipsis(ctx, player.nextTitle || 'Pick another video', 520, 28, 'bold'), 360, 164, 28, '#FFFFFF', 'center', 'bold');
-            text(ctx, player.autoplayIn > 0 ? 'Playing in ' + player.autoplayIn + 's' : 'Autoplay is off', 360, 204, 18, 'rgba(180,212,220,0.85)', 'center');
-            rounded(ctx, 280, 220, 180, 56, 14); ctx.fillStyle = 'rgba(47,208,192,0.95)'; ctx.fill();
-            text(ctx, 'Replay', 370, 249, 20, '#03211E', 'center', 'bold');
-            rounded(ctx, 540, 220, 170, 56, 14); ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fill();
-            text(ctx, 'Cancel', 625, 249, 20, '#FFFFFF', 'center', 'bold');
-            this.layer(session, 'jt-center', this.center, 720, 420, 280, 150, { x: 340, y: 220, width: 600, height: 280 });
-            return;
-        }
-        if (player.paused) {
-            ctx.beginPath(); ctx.arc(360, 210, 52, 0, Math.PI * 2); ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fill();
-            ctx.fillStyle = 'rgba(8,24,30,0.95)'; triangle(ctx, 344, 182, 42, 'right');
-            rounded(ctx, 280, 278, 160, 44, 22); ctx.fillStyle = 'rgba(4,16,20,0.72)'; ctx.fill();
-            text(ctx, 'Paused', 360, 300, 24, 'rgba(255,255,255,0.95)', 'center', 'bold');
-            this.layer(session, 'jt-center', this.center, 720, 420, 280, 150, { x: 558, y: 306, width: 164, height: 168 });
-            return;
-        }
-        this.remove(session, 'jt-center');
+        const o = PLAYER.pausedCard;
+        ctx.fillStyle = '#091B21'; ctx.fillRect(0, 0, o.w, o.h);
+        ctx.fillStyle = '#FFFFFF'; disc(ctx, o.w / 2, 86, 62);
+        ctx.fillStyle = '#08181E'; triangle(ctx, o.w / 2 - 18, 86 - 30, 60, 'right');
+        text(ctx, 'Paused', o.w / 2, 178, 26, '#FFFFFF', 'center', 'bold');
+        this.layer(session, 'jt-center', this.center, o.w, o.h, o.x, o.y, { x: o.x, y: o.y, width: o.w, height: o.h });
     }
-    drawVolume(session, player) {
-        const ctx = this.vol.getContext('2d');
-        ctx.globalAlpha = player.controlsAlpha == null ? 1 : player.controlsAlpha;
-        ctx.clearRect(0, 0, 250, 64);
-        rounded(ctx, 0, 0, 250, 64, 32); ctx.fillStyle = 'rgba(6,22,28,0.66)'; ctx.fill();
-        ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 1; ctx.stroke();
-        text(ctx, '−', 40, 33, 28, 'rgba(255,255,255,0.94)', 'center', 'bold');
-        text(ctx, '+', 212, 33, 26, 'rgba(255,255,255,0.94)', 'center', 'bold');
-        ctx.fillStyle = 'rgba(255,255,255,0.82)';
-        ctx.beginPath(); ctx.moveTo(78, 33); ctx.lineTo(90, 23); ctx.lineTo(90, 55); ctx.lineTo(78, 45); ctx.closePath(); ctx.fill();
-        ctx.fillRect(74, 31, 5, 16);
-        var level = Math.max(1, Math.min(10, Math.round(player.volume || 7)));
-        for (var i = 0; i < 10; i++) {
-            var height = 10 + i * 1.4;
-            ctx.fillStyle = i < level ? '#2FD0C0' : 'rgba(255,255,255,0.20)';
-            ctx.fillRect(106 + i * 7, 33 - height / 2, 4, height);
+    // Bottom row: -10 s, Play/Pause, +10 s, Captions, volume, settings, Next.
+    drawBar(session, player) {
+        const o = PLAYER.bar, ctx = this.bar.getContext('2d');
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, W, o.h);
+        ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, W, o.h);
+        const panel = '#17363F', white = '#FFFFFF';
+        const b10 = at(PLAYER.back10, o), f10 = at(PLAYER.fwd10, o), p = at(PLAYER.play, o);
+        button(ctx, b10, panel); button(ctx, f10, panel);
+        skipGlyph(ctx, b10.x + b10.w / 2, b10.y + b10.h / 2 + 4, false, white);
+        skipGlyph(ctx, f10.x + f10.w / 2, f10.y + f10.h / 2 + 4, true, white);
+        button(ctx, p, '#2FD0C0');
+        ctx.fillStyle = '#03211E';
+        if (player.paused) triangle(ctx, p.x + p.w / 2 - 14, p.y + p.h / 2 - 22, 44, 'right');
+        else { ctx.fillRect(p.x + p.w / 2 - 18, p.y + p.h / 2 - 22, 12, 44); ctx.fillRect(p.x + p.w / 2 + 6, p.y + p.h / 2 - 22, 12, 44); }
+        const cc = at(PLAYER.captions, o), unavailable = player.captionsAvailable === false;
+        button(ctx, cc, player.captionsOn ? '#2FD0C0' : panel);
+        const ccInk = player.captionsOn ? '#03211E' : unavailable ? 'rgba(255,255,255,0.4)' : white;
+        rounded(ctx, cc.x + 24, cc.y + 22, 64, 44, 8); ctx.strokeStyle = ccInk; ctx.lineWidth = 4; ctx.stroke();
+        text(ctx, 'CC', cc.x + 56, cc.y + 45, 24, ccInk, 'center', 'bold');
+        const down = at(PLAYER.volDown, o), up = at(PLAYER.volUp, o);
+        button(ctx, down, panel); button(ctx, up, panel);
+        ctx.fillStyle = white; ctx.fillRect(down.x + 26, down.y + 41, 36, 7);
+        ctx.fillRect(up.x + 26, up.y + 41, 36, 7); ctx.fillRect(up.x + 40.5, up.y + 26, 7, 36);
+        const level = Math.max(0, Math.min(10, Math.round(player.volume == null ? 7 : player.volume)));
+        speaker(ctx, down.x + down.w + 8, down.y + 26, 36, 'rgba(255,255,255,0.92)');
+        text(ctx, String(level), down.x + down.w + 64, down.y + 45, 30, white, 'center', 'bold');
+        const gear = at(PLAYER.settings, o);
+        button(ctx, gear, panel);
+        ctx.save(); ctx.translate(gear.x + gear.w / 2, gear.y + gear.h / 2);
+        ctx.fillStyle = white;
+        for (let i = 0; i < 8; i++) { ctx.save(); ctx.rotate(i * Math.PI / 4); ctx.fillRect(-5, -26, 10, 12); ctx.restore(); }
+        ctx.beginPath(); ctx.arc(0, 0, 17, 0, Math.PI * 2); ctx.lineWidth = 7; ctx.strokeStyle = white; ctx.stroke();
+        ctx.restore();
+        if (player.nextTitle) {
+            const next = at(PLAYER.next, o);
+            button(ctx, next, panel);
+            ctx.fillStyle = white; triangle(ctx, next.x + 18, next.y + 28, 32, 'right'); ctx.fillRect(next.x + 52, next.y + 28, 7, 32);
+            text(ctx, 'Next', next.x + 96, next.y + 45, 24, white, 'center', 'bold');
         }
-        this.layer(session, 'jt-vol', this.vol, 250, 64, 985, 552, false); // inside the bar's hole
+        this.layer(session, 'jt-bar', this.bar, W, o.h, 0, o.y);
+    }
+    // Times and the scrubber: redrawn about once a second.
+    drawTime(session, player) {
+        const ctx = this.time.getContext('2d'), s = PLAYER.scrub, ox = s.x - 20, oy = PLAYER.bar.y;
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, 1080, 140);
+        const fraction = Math.max(0, Math.min(1, (player.position || 0) / Math.max(1, player.duration || 1)));
+        const x = s.x - ox, y = s.y - oy + s.h / 2, w = s.w;
+        rounded(ctx, x, y - 6, w, 12, 6); ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.fill();
+        rounded(ctx, x, y - 6, Math.max(12, w * fraction), 12, 6); ctx.fillStyle = '#FF6B5A'; ctx.fill();
+        ctx.fillStyle = '#FFFFFF'; disc(ctx, x + w * fraction, y, 16);
+        text(ctx, clock(player.position), x, 26, 26, '#FFFFFF', 'left', 'bold');
+        text(ctx, clock(player.duration), x + w, 26, 26, '#FFFFFF', 'right', 'bold');
+        this.layer(session, 'jt-time', this.time, 1080, 140, ox, oy, false); // inside the bar's hole
     }
     drawCaption(session, player) {
         if (!player.captionText) { this.remove(session, 'jt-caption'); return; }
         const ctx = this.caption.getContext('2d');
-        ctx.globalAlpha = 1; ctx.clearRect(0, 0, 1000, 90);
+        ctx.globalAlpha = 1; ctx.clearRect(0, 0, 1000, 100);
         const words = String(player.captionText).split(' '), lines = []; let line = '';
-        ctx.font = '26px ' + FONT;
+        ctx.font = 'bold 28px ' + FONT;
         words.forEach(word => {
             const test = (line + ' ' + word).trim();
-            if (ctx.measureText(test).width > 920 && line) { lines.push(line); line = word; }
+            if (ctx.measureText(test).width > 940 && line) { lines.push(line); line = word; }
             else line = test;
         });
         if (line) lines.push(line);
-        const shown = lines.slice(0, 2);
-        const height = 18 + shown.length * 32;
-        rounded(ctx, 0, 80 - height, 1000, height, 14); ctx.fillStyle = 'rgba(2,10,13,0.74)'; ctx.fill();
-        shown.forEach((entry, index) => text(ctx, entry, 500, 80 - height + 26 + index * 32, 26, 'rgba(255,255,255,0.97)', 'center', 'bold'));
-        this.layer(session, 'jt-caption', this.caption, 1000, 90, 140, 455, { x: 140, y: 535 - height, width: 1000, height: height });
+        const shown = lines.slice(-2);
+        const height = 20 + shown.length * 36;
+        ctx.fillStyle = '#020A0D'; ctx.fillRect(0, 100 - height, 1000, height);
+        shown.forEach((entry, index) => text(ctx, ellipsis(ctx, entry, 960, 28, 'bold'), 500, 100 - height + 28 + index * 36, 28, '#FFFFFF', 'center', 'bold'));
+        // Above the controls when they are shown, near the bottom otherwise.
+        const bottom = player.controlsVisible !== false || player.paused ? 462 : 700;
+        this.layer(session, 'jt-caption', this.caption, 1000, 100, 140, bottom - 100, { x: 140, y: bottom - height, width: 1000, height: height });
     }
     drawSettings(session, player) {
         if (!player.settingsOpen) { this.remove(session, 'jt-settings'); return; }
-        const ctx = this.settings.getContext('2d');
-        ctx.globalAlpha = 1; ctx.clearRect(0, 0, 680, 420);
-        rounded(ctx, 0, 0, 680, 420, 26); ctx.fillStyle = 'rgba(7,21,27,0.97)'; ctx.fill();
-        ctx.strokeStyle = 'rgba(47,208,192,0.46)'; ctx.lineWidth = 2; ctx.stroke();
-        text(ctx, 'Playback settings', 340, 40, 28, '#FFFFFF', 'center', 'bold');
-        const chip = (x, y, w, h, label, selected, disabled) => {
-            rounded(ctx, x, y, w, h, 14); ctx.fillStyle = selected ? 'rgba(47,208,192,0.20)' : 'rgba(255,255,255,0.06)'; ctx.fill();
-            ctx.strokeStyle = selected ? 'rgba(47,208,192,0.9)' : 'rgba(255,255,255,0.13)'; ctx.lineWidth = selected ? 2 : 1; ctx.stroke();
-            text(ctx, label, x + w / 2, y + h / 2 + 1, 19, disabled ? 'rgba(255,255,255,0.38)' : selected ? '#FFFFFF' : 'rgba(220,238,242,0.86)', 'center', selected ? 'bold' : 'normal');
+        const o = PLAYER.panel, ctx = this.settings.getContext('2d');
+        ctx.globalAlpha = 1; ctx.clearRect(0, 0, o.w, o.h);
+        ctx.fillStyle = '#091B21'; ctx.fillRect(0, 0, o.w, o.h);
+        ctx.fillStyle = '#2FD0C0'; ctx.fillRect(0, 0, o.w, 6);
+        text(ctx, 'Player settings', o.w / 2, 44, 30, '#FFFFFF', 'center', 'bold');
+        const chip = (r, label, selected, disabled) => {
+            const c = at(r, o);
+            rounded(ctx, c.x, c.y, c.w, c.h, 16); ctx.fillStyle = selected ? '#2FD0C0' : 'rgba(255,255,255,0.10)'; ctx.fill();
+            text(ctx, label, c.x + c.w / 2, c.y + c.h / 2 + 1, 24, disabled ? 'rgba(255,255,255,0.4)' : selected ? '#03211E' : '#FFFFFF', 'center', 'bold');
         };
-        text(ctx, 'CAPTIONS', 40, 88, 16, 'rgba(126,156,166,1)', 'left', 'bold');
-        chip(320, 65, 120, 46, 'Off', !player.captionsOn);
-        chip(452, 65, 120, 46, 'On', player.captionsOn, player.captionsAvailable === false);
-        if (player.captionsAvailable === false) text(ctx, 'No captions', 200, 88, 15, 'rgba(126,156,166,0.9)', 'left');
-        text(ctx, 'LOOP', 40, 158, 16, 'rgba(126,156,166,1)', 'left', 'bold');
-        chip(320, 135, 120, 46, 'Off', !player.loop);
-        chip(452, 135, 120, 46, 'On', player.loop);
-        text(ctx, 'AUTOPLAY', 40, 228, 16, 'rgba(126,156,166,1)', 'left', 'bold');
-        chip(320, 205, 120, 46, 'Off', !player.autoplay);
-        chip(452, 205, 120, 46, 'On', player.autoplay);
-        text(ctx, 'QUALITY', 40, 300, 14, 'rgba(126,156,166,0.85)', 'left', 'bold');
-        text(ctx, player.height ? player.height + 'p' : 'Auto', 40, 320, 17, 'rgba(200,225,232,0.9)', 'left');
-        rounded(ctx, 240, 340, 200, 56, 14); ctx.fillStyle = 'rgba(255,255,255,0.10)'; ctx.fill();
-        text(ctx, 'Done', 340, 368, 21, '#FFFFFF', 'center', 'bold');
-        this.layer(session, 'jt-settings', this.settings, 680, 420, 300, 150);
+        const values = [player.captionsOn, player.loop, player.autoplay];
+        PLAYER.settingsRows.forEach((row, i) => {
+            const y = row.off.y - o.y + row.off.h / 2;
+            text(ctx, row.label, 44, y, 26, '#FFFFFF', 'left', 'bold');
+            if (i === 0 && player.captionsAvailable === false) text(ctx, 'None for this video', 44, y + 26, 18, 'rgba(196,220,226,0.85)', 'left');
+            chip(row.off, 'Off', !values[i]);
+            chip(row.on, 'On', !!values[i], i === 0 && player.captionsAvailable === false);
+        });
+        const d = at(PLAYER.done, o);
+        rounded(ctx, d.x, d.y, d.w, d.h, 16); ctx.fillStyle = 'rgba(255,255,255,0.14)'; ctx.fill();
+        text(ctx, 'Done', d.x + d.w / 2, d.y + d.h / 2, 26, '#FFFFFF', 'center', 'bold');
+        this.layer(session, 'jt-settings', this.settings, o.w, o.h, o.x, o.y);
     }
     drawToast(session, player) {
         if (!player.toast) { this.remove(session, 'jt-toast'); return; }
         const ctx = this.toast.getContext('2d');
         ctx.clearRect(0, 0, 860, 64);
-        rounded(ctx, 0, 4, 860, 56, 18); ctx.fillStyle = 'rgba(9,36,42,0.92)'; ctx.fill();
-        ctx.fillStyle = 'rgba(47,208,192,1)'; ctx.fillRect(0, 12, 5, 40);
-        text(ctx, ellipsis(ctx, player.toast, 800, 20), 28, 33, 20, 'rgba(236,250,252,0.96)', 'left', 'bold');
-        this.layer(session, 'jt-toast', this.toast, 860, 64, 210, 116, { x: 210, y: 120, width: 860, height: 56 });
+        ctx.fillStyle = '#0B2A31'; ctx.fillRect(0, 4, 860, 56);
+        ctx.fillStyle = '#2FD0C0'; ctx.fillRect(0, 4, 6, 56);
+        text(ctx, ellipsis(ctx, player.toast, 800, 22, 'bold'), 30, 33, 22, 'rgba(236,250,252,0.98)', 'left', 'bold');
+        this.layer(session, 'jt-toast', this.toast, 860, 64, 210, 124, { x: 210, y: 128, width: 860, height: 56 });
     }
     remove(session, name) {
         const entry = this.sprites[name];
@@ -291,42 +339,49 @@ class Overlay {
     }
     // Draw everything again on the next update (the host lost its layers).
     resend() { this.keys = {}; this.lastTime = 0; }
-    // Every layer is a full RGBA image piped to the video host, so only layers
-    // whose content changed are drawn: a blanket redraw cost up to 6 MB and a
-    // third of a second of the renderer per tap. A new video session starts
-    // with no layers and gets everything once. `force` only marks a moment
-    // that must be current, such as the clock after a seek.
+    // Only layers whose content changed are redrawn: a blanket redraw cost up
+    // to a third of a second of the renderer per tap. A new video session
+    // starts with no layers and gets everything once. `force` only marks a
+    // moment that must be current, such as the clock after a seek.
     update(session, player, force) {
         if (!session || !player) return;
         if (this.session !== session) { this.session = session; this.resend(); this.holesKey = ''; }
-        const visible = player.controlsVisible !== false;
-        const alpha = player.controlsAlpha == null ? 1 : player.controlsAlpha;
-        if (!visible) {
-            this.remove(session, 'jt-top'); this.remove(session, 'jt-bar'); this.remove(session, 'jt-time'); this.remove(session, 'jt-vol');
-            delete this.keys.top; delete this.keys.bar; delete this.keys.vol; this.lastTime = 0;
-        } else {
-            const topKey = [player.id, player.title, player.channel, player.sponsorCount, alpha].join('|');
+        const settings = !!player.settingsOpen && !player.ended;
+        const controls = !player.ended && (player.controlsVisible !== false || player.paused);
+        const top = controls || settings || player.starting;
+        const bar = controls && !settings && !player.starting;
+        if (!top) { this.remove(session, 'jt-top'); delete this.keys.top; }
+        else {
+            const topKey = [player.id, player.title, player.channel, player.sponsorCount].join('|');
             if (this.keys.top !== topKey) { this.keys.top = topKey; this.drawTop(session, player); }
-            const barKey = [player.id, player.paused, player.ended, player.nextTitle, alpha].join('|');
+        }
+        if (!bar) {
+            this.remove(session, 'jt-bar'); this.remove(session, 'jt-time');
+            delete this.keys.bar; delete this.keys.time; this.lastTime = 0;
+        } else {
+            const barKey = [player.id, player.paused, player.captionsOn, player.captionsAvailable, Math.round(player.volume == null ? 7 : player.volume), player.nextTitle].join('|');
             if (this.keys.bar !== barKey) { this.keys.bar = barKey; this.drawBar(session, player); }
-            const volKey = [player.id, player.volume, alpha].join('|');
-            if (this.keys.vol !== volKey) { this.keys.vol = volKey; this.drawVolume(session, player); }
-            const timeKey = [player.id, Math.floor(player.position || 0), player.duration, alpha].join('|');
+            const timeKey = [player.id, Math.floor(player.position || 0), player.duration].join('|');
             if (this.keys.time !== timeKey && (force || Date.now() - this.lastTime > 1000)) {
                 this.keys.time = timeKey; this.lastTime = Date.now(); this.drawTime(session, player);
             }
         }
-        const centerKey = [player.id, player.starting, player.paused, player.ended, player.nextTitle, player.autoplayIn, player.statusText].join('|');
-        if (this.keys.center !== centerKey) { this.keys.center = centerKey; this.drawCenter(session, player); }
-        const toastKey = [player.id, player.toast].join('|');
-        if (this.keys.toast !== toastKey) { this.keys.toast = toastKey; this.drawToast(session, player); }
-        const captionKey = [player.id, player.captionsOn, player.captionText].join('|');
+        const centerShown = player.starting || (player.paused && !settings && !player.ended);
+        if (!centerShown) { this.remove(session, 'jt-center'); delete this.keys.center; }
+        else {
+            const centerKey = [player.id, player.starting, player.paused, player.starting ? player.statusText + '|' + (player.statusCode || '') + '|' + Math.floor(player.position || 0) + '|' + Math.floor(Date.now() / 400) : ''].join('|');
+            if (this.keys.center !== centerKey) { this.keys.center = centerKey; this.drawCenter(session, player); }
+        }
+        const toast = settings ? '' : player.toast;
+        const toastKey = [player.id, toast].join('|');
+        if (this.keys.toast !== toastKey) { this.keys.toast = toastKey; this.drawToast(session, Object.assign({}, player, { toast: toast })); }
+        const captionKey = [player.id, player.captionsOn, player.captionText, controls].join('|');
         if (this.keys.caption !== captionKey) { this.keys.caption = captionKey; this.drawCaption(session, player); }
-        const settingsKey = [player.id, player.settingsOpen, player.captionsOn, player.loop, player.autoplay, player.captionsAvailable].join('|');
-        if (this.keys.settings !== settingsKey) { this.keys.settings = settingsKey; this.drawSettings(session, player); }
+        const settingsKey = [player.id, settings, player.captionsOn, player.loop, player.autoplay, player.captionsAvailable].join('|');
+        if (this.keys.settings !== settingsKey) { this.keys.settings = settingsKey; this.drawSettings(session, Object.assign({}, player, { settingsOpen: settings })); }
         this.flush(session);
     }
     reset() { this.keys = {}; this.lastTime = 0; }
 }
 
-module.exports = { Overlay: Overlay };
+module.exports = { Overlay: Overlay, PLAYER: PLAYER, startingWords: startingWords };
