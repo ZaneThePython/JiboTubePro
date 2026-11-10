@@ -33,7 +33,10 @@ module.exports = function () {
     const jetstream = { events: { hjHeard: interrupt }, types: { HotwordListenMode: { Disabled: 'disabled' } },
         setHotwordMode: mode => { assert.strictEqual(mode, 'disabled'); hotwordOff++; let live = true;
             return { activated: Promise.resolve(), release: () => { assert(live, 'released twice'); live = false; hotwordOff--; return Promise.resolve(); } }; } };
-    const options = { document: doc, PIXI: PIXI, stage: stage, jibo: { jetstream: jetstream }, url: 'http://127.0.0.1/video', audioUrl: 'http://127.0.0.1/audio', audio: true };
+    let attentionOff = 0; // live "attention OFF" handles
+    const expression = { AttentionMode: { OFF: 'OFF' }, pushAttentionMode: mode => { assert.strictEqual(mode, 'OFF'); attentionOff++; let live = true;
+        return Promise.resolve({ release: () => { assert(live, 'attention released twice'); live = false; attentionOff--; return Promise.resolve(); } }); } };
+    const options = { document: doc, PIXI: PIXI, stage: stage, jibo: { jetstream: jetstream, expression: expression }, url: 'http://127.0.0.1/video', audioUrl: 'http://127.0.0.1/audio', audio: true };
     const session = video.open(options); let stopped, ended = false;
     session.on('error', error => { throw Error(error.detail); });
     session.on('state', event => { if (event.state === 'stopped') stopped = event; if (event.state === 'ended') ended = true; });
@@ -49,7 +52,7 @@ module.exports = function () {
         session.sync(); assert.strictEqual(session.media.plays, 0, 'canplay alone does not bypass the initial buffer');
         session.media.ranges = [[0, 3.1]]; session.media.fire('progress');
         assert(!session.media.paused); assert(!session.audio.paused); assert.strictEqual(session.state, 'playing');
-        assert.strictEqual(hotwordOff, 1, 'no wake word while a video plays');
+        assert.strictEqual(hotwordOff, 1, 'no wake word while a video plays'); assert.strictEqual(attentionOff, 1, 'no turning toward sounds while a video plays');
         assert.strictEqual(session.sprite.width, 960); assert.strictEqual(session.sprite.x, 160);
         session.media.currentTime = 5; session.audio.currentTime = 7; session.sync(); assert.strictEqual(session.audio.currentTime, 7, 'sync must not seek a sequential audio stream');
         assert.strictEqual(session.audio.playbackRate, 0.95);
@@ -61,10 +64,11 @@ module.exports = function () {
         assert.strictEqual(hotwordOff, 0, 'paused: "Hey Jibo" works again');
         return Promise.resolve();
     }).then(() => {
+        assert.strictEqual(attentionOff, 0, 'paused: attention back on');
         session.show(); assert(!session.media.paused && !session.audio.paused);
         session.media.ranges = [[0, 5.1]]; session.audio.ranges = [[0, 7.1]];
         session.media.fire('waiting'); assert(session.media.paused && session.audio.paused); assert.strictEqual(session.state, 'buffering');
-        assert.strictEqual(hotwordOff, 1, 'a rebuffer mid-video keeps the wake word off');
+        assert.strictEqual(hotwordOff, 1, 'a rebuffer mid-video keeps the wake word off'); assert.strictEqual(attentionOff, 1, 'and attention off');
         return Promise.resolve();
     }).then(() => {
         const plays = session.media.plays;
@@ -91,6 +95,7 @@ module.exports = function () {
         const failed = video.open(options); let error;
         failed.on('error', event => { error = event; });
         return new Promise(resolve => setTimeout(resolve, 5)).then(() => {
+            assert.strictEqual(attentionOff, 0, 'ended: attention back on');
             failed.media.error = { code: 4, message: 'Unsupported format' }; failed.media.fire('error');
             assert.strictEqual(error.reason, 'media_4'); assert.strictEqual(failed.state, 'stopped'); assert.strictEqual(doc.body.children.length, 0);
             const early = video.open(options); return early.stop().then(() => assert.strictEqual(doc.body.children.length, 0));

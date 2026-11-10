@@ -32,20 +32,26 @@ class Session extends EventEmitter {
         if (state === 'playing') this.hotword(true); else if (state === 'paused' || state === 'ended') this.hotword(false);
         this.state = state; this.emit('state', Object.assign({ state: state }, extra || {}));
     }
-    // No "Hey Jibo" while a video plays (the stock privacy-mode API); touching him still stops it.
+    // No "Hey Jibo" and no turning toward sounds or faces while a video plays (the stock
+    // privacy-mode and attention APIs); touching him still stops it.
     hotword(blocked) {
         if (blocked === !!this.hotwordHandle) return;
         if (!blocked) {
-            const handle = this.hotwordHandle; this.hotwordHandle = null;
+            const handle = this.hotwordHandle, attention = this.attention; this.hotwordHandle = this.attention = null;
             try { Promise.resolve(handle.release()).catch(() => {}); } catch (_) {}
+            if (attention) attention.then(h => h && h.release()).catch(() => {});
             return;
         }
-        const jetstream = (this.options.jibo || require('jibo')).jetstream;
+        const jibo = this.options.jibo || require('jibo'), jetstream = jibo.jetstream, expression = jibo.expression;
         if (!jetstream || !jetstream.setHotwordMode || !jetstream.types) return;
         try {
             this.hotwordHandle = jetstream.setHotwordMode(jetstream.types.HotwordListenMode.Disabled);
             Promise.resolve(this.hotwordHandle && this.hotwordHandle.activated).catch(() => {});
-        } catch (error) { this.hotwordHandle = null; diagnostics.record('video hotword', error && error.message); }
+        } catch (error) { this.hotwordHandle = null; diagnostics.record('video hotword', error && error.message); return; }
+        try {
+            if (expression && expression.pushAttentionMode) this.attention = Promise.resolve(expression.pushAttentionMode(expression.AttentionMode.OFF));
+        } catch (error) { diagnostics.record('video attention', error && error.message); }
+        if (this.attention) this.attention.catch(error => diagnostics.record('video attention', error && error.message));
     }
     start() {
         if (!this.active()) return;
