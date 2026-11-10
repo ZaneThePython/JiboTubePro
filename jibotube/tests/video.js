@@ -29,7 +29,11 @@ module.exports = function () {
     const doc = { body: new Node('body'), createElement: name => new Node(name) };
     const PIXI = { Container: Container, Graphics: Graphics, VideoBaseTexture: VideoBaseTexture, Texture: Texture, Sprite: Sprite };
     const stage = new Container(), interrupt = signal();
-    const options = { document: doc, PIXI: PIXI, stage: stage, jibo: { jetstream: { events: { hjHeard: interrupt } } }, url: 'http://127.0.0.1/video', audioUrl: 'http://127.0.0.1/audio', audio: true };
+    let hotwordOff = 0; // live "wake word disabled" handles
+    const jetstream = { events: { hjHeard: interrupt }, types: { HotwordListenMode: { Disabled: 'disabled' } },
+        setHotwordMode: mode => { assert.strictEqual(mode, 'disabled'); hotwordOff++; let live = true;
+            return { activated: Promise.resolve(), release: () => { assert(live, 'released twice'); live = false; hotwordOff--; return Promise.resolve(); } }; } };
+    const options = { document: doc, PIXI: PIXI, stage: stage, jibo: { jetstream: jetstream }, url: 'http://127.0.0.1/video', audioUrl: 'http://127.0.0.1/audio', audio: true };
     const session = video.open(options); let stopped, ended = false;
     session.on('error', error => { throw Error(error.detail); });
     session.on('state', event => { if (event.state === 'stopped') stopped = event; if (event.state === 'ended') ended = true; });
@@ -40,10 +44,12 @@ module.exports = function () {
         assert(session.media.paused, 'video waits for the separate audio stream');
         session.audio.readyState = 3; session.audio.ranges = [[0, 10]]; session.audio.fire('loadeddata');
         assert(session.media.paused && session.audio.paused, 'one decoded frame must not start playback');
+        assert.strictEqual(hotwordOff, 0, 'wake word stays on until the video plays');
         session.media.readyState = 3; session.media.ranges = [[0, 0.4]]; session.media.fire('canplay');
         session.sync(); assert.strictEqual(session.media.plays, 0, 'canplay alone does not bypass the initial buffer');
         session.media.ranges = [[0, 3.1]]; session.media.fire('progress');
         assert(!session.media.paused); assert(!session.audio.paused); assert.strictEqual(session.state, 'playing');
+        assert.strictEqual(hotwordOff, 1, 'no wake word while a video plays');
         assert.strictEqual(session.sprite.width, 960); assert.strictEqual(session.sprite.x, 160);
         session.media.currentTime = 5; session.audio.currentTime = 7; session.sync(); assert.strictEqual(session.audio.currentTime, 7, 'sync must not seek a sequential audio stream');
         assert.strictEqual(session.audio.playbackRate, 0.95);
@@ -52,11 +58,13 @@ module.exports = function () {
         session.media.ranges = [[0, 20]]; session.audio.ranges = [[0, 20]];
         assert.strictEqual(session.position(), 5);
         session.pause(); assert(session.media.paused && session.audio.paused);
+        assert.strictEqual(hotwordOff, 0, 'paused: "Hey Jibo" works again');
         return Promise.resolve();
     }).then(() => {
         session.show(); assert(!session.media.paused && !session.audio.paused);
         session.media.ranges = [[0, 5.1]]; session.audio.ranges = [[0, 7.1]];
         session.media.fire('waiting'); assert(session.media.paused && session.audio.paused); assert.strictEqual(session.state, 'buffering');
+        assert.strictEqual(hotwordOff, 1, 'a rebuffer mid-video keeps the wake word off');
         return Promise.resolve();
     }).then(() => {
         const plays = session.media.plays;
@@ -75,6 +83,7 @@ module.exports = function () {
         session.media.duration = 6; session.media.ranges = [[0, 6]];
         assert(session.bufferedEnough(session.media), 'fully buffered short remainder may play without five extra seconds');
         session.media.fire('ended'); assert(ended); assert(session.audio.paused);
+        assert.strictEqual(hotwordOff, 0, 'ended: wake word back on');
         const media = session.media, texture = session.texture;
         interrupt.fire(); assert(stopped && /^interrupted:/.test(stopped.reason));
         assert.strictEqual(interrupt.count(), 0); assert.strictEqual(media.src, ''); assert(texture.destroyed);

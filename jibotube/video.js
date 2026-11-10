@@ -29,7 +29,23 @@ class Session extends EventEmitter {
     }
     stateChanged(state, extra) {
         if (!this.active()) return;
+        if (state === 'playing') this.hotword(true); else if (state === 'paused' || state === 'ended') this.hotword(false);
         this.state = state; this.emit('state', Object.assign({ state: state }, extra || {}));
+    }
+    // No "Hey Jibo" while a video plays (the stock privacy-mode API); touching him still stops it.
+    hotword(blocked) {
+        if (blocked === !!this.hotwordHandle) return;
+        if (!blocked) {
+            const handle = this.hotwordHandle; this.hotwordHandle = null;
+            try { Promise.resolve(handle.release()).catch(() => {}); } catch (_) {}
+            return;
+        }
+        const jetstream = (this.options.jibo || require('jibo')).jetstream;
+        if (!jetstream || !jetstream.setHotwordMode || !jetstream.types) return;
+        try {
+            this.hotwordHandle = jetstream.setHotwordMode(jetstream.types.HotwordListenMode.Disabled);
+            Promise.resolve(this.hotwordHandle && this.hotwordHandle.activated).catch(() => {});
+        } catch (error) { this.hotwordHandle = null; diagnostics.record('video hotword', error && error.message); }
     }
     start() {
         if (!this.active()) return;
@@ -211,6 +227,7 @@ class Session extends EventEmitter {
     stop(reason) {
         if (this.stopped) return Promise.resolve();
         const position = this.position();
+        this.hotword(false);
         this.stopped = true;
         timers.clearTimeout(this.startTimer); timers.clearInterval(this.syncTimer);
         this.detach.forEach(off => { try { off(); } catch (_) {} }); this.detach = [];
