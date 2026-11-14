@@ -1,8 +1,13 @@
 {
   "name": "JiboTube Pro",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "supported": "3.1.6",
   "type": "skill",
   "themes": false,
-  "buttonColor": "#FF4545 #8F1717"
+  "buttonColor": "#FF4545 #8F1717",
+  "permissions": [
+    "microphone",
+    "jibo-apis",
+    "run-programs"
+  ]
 }
